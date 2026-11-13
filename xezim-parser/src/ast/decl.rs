@@ -973,6 +973,9 @@ pub struct ModportPort {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GateInstantiation {
     pub gate_type: GateType,
+    /// Explicit §28.3.2 strength, whose resolution is not yet lowered.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub has_strength: bool,
     /// `buf #(d) g(y, a);` — the gate's RISE delay (the first expression of
     /// the delay spec). Counts the enclosing module's timeunit until the
     /// elaborator pre-scales it to ticks.

@@ -45219,6 +45219,21 @@ fn make_tristate(cond: Expression, then_e: Expression, span: Span) -> Expression
 }
 
 fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Expression)> {
+    // IEEE 1800-2023 §28.4/§28.5, Tables 28-3/28-4: a logic gate
+    // maps z to x even when its lowered expression is just its input.
+    // Delayed assignments bypass the simulator's undelayed buffer gate;
+    // request that conversion explicitly on that path. The value wrapper
+    // retains the existing real-input conversion at the assignment target.
+    let delayed_logic_input = |input: Expression| {
+        // Explicit strengths are not lowered yet. Preserve that path: an
+        // unmodelled weak x driver could otherwise override a strong value.
+        if gi.delay.is_some() && !gi.has_strength {
+            let span = input.span;
+            make_syscall("$__logic_buf", vec![input], span)
+        } else {
+            input
+        }
+    };
     let mut pairs = Vec::new();
     for inst in &gi.instances {
         // §28 pull gates: `pullup (net)` / `pulldown (net)` — single terminal
@@ -45253,6 +45268,13 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
         }
         let out = inst.terminals[0].clone();
         let in1 = inst.terminals[1].clone();
+        let in1 = if inst.terminals.len() == 2
+            && matches!(gi.gate_type, GateType::And | GateType::Or | GateType::Xor)
+        {
+            delayed_logic_input(in1)
+        } else {
+            in1
+        };
         let sp = out.span;
         match gi.gate_type {
             // §28 tristate buffers/inverters: `bufif1(out,in,ctl)` etc.
@@ -45463,7 +45485,7 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
             GateType::Buf => {
                 let (input, outs) = inst.terminals.split_last().unwrap_or((&in1, &[]));
                 for o in outs {
-                    pairs.push((o.clone(), input.clone()));
+                    pairs.push((o.clone(), delayed_logic_input(input.clone())));
                 }
             }
             _ => {}

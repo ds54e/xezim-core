@@ -212,7 +212,8 @@ pub use value::Value;
 /// the ordinary transition fields used by legacy primitive and net delays.
 /// \x3f = \x3e + assignment target bits/vector shape and declared vector nets (§10.3.3).
 /// \x40 = \x3f + corrected constant real math and signature parameter types (§11.2.1, §6.20.2).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x40";
+/// \x41 = \x40 + primitive explicit-strength presence (§28.3.2).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x41";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

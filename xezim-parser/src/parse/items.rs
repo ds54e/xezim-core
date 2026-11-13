@@ -3594,7 +3594,8 @@ impl Parser {
         // Optional drive_strength `(strong0, strong1)` / charge_strength
         // `(small)` / pull strength `(pull1)` (§28.4). xezim doesn't model
         // strengths; consume the group when it opens with a strength keyword.
-        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
+        let has_strength = self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword();
+        if has_strength {
             self.bump(); // (
             while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                 self.bump();
@@ -3666,6 +3667,7 @@ impl Parser {
         self.expect(TokenKind::Semicolon);
         GateInstantiation {
             gate_type,
+            has_strength,
             delay,
             delay_fall,
             instances,
