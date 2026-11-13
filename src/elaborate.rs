@@ -9674,6 +9674,37 @@ pub fn elaborate_module_with_defs(
     let _oom_trace = crate::oom_trace::session();
     let _oom_definition = crate::oom_trace::definition(module, "elaborate module", module.name());
     let mut elab = ElaboratedModule::new(module.name().to_string());
+    // Apply own-instance defparams before any parameter-dependent shape is
+    // elaborated, using the same target checks as the child-instance path.
+    let mut own = own_instance_defparams(&elab, module, "")?;
+    let own_module = if let Definition::Module(m) = module
+        && !own.is_empty()
+    {
+        let mut m = m.clone();
+        for pd in m
+            .params
+            .iter_mut()
+            .chain(m.items.iter_mut().filter_map(|it| match it {
+                ModuleItem::ParameterDeclaration(pd) => Some(pd),
+                _ => None,
+            }))
+        {
+            if let ParameterKind::Data { assignments, .. } = &mut pd.kind {
+                for a in assignments {
+                    if let Some(rhs) = own.remove(&a.name.name) {
+                        a.init = Some(rhs);
+                    }
+                }
+            }
+        }
+        Some(m)
+    } else {
+        None
+    };
+    let module = own_module
+        .as_ref()
+        .map(Definition::Module)
+        .unwrap_or(module);
     // §6.5/§10: within a scope a net/variable must be DECLARED before it is
     // referenced (implicit nets §6.10 are the only exception, and they do not
     // apply to a name declared LATER). Check every data expression, including
@@ -38311,6 +38342,105 @@ struct PendingDefparam {
     owner: String,
 }
 
+/// §23.10.1: the containing module instance is also a defparam target.
+/// Keep scope-dependent RHSs on the existing path until their declaring
+/// environment is available; never evaluate an unresolved name as zero.
+fn own_instance_defparams(
+    elab: &ElaboratedModule,
+    def: Definition,
+    prefix: &str,
+) -> Result<HashMap<String, Expression>, String> {
+    let mut out = HashMap::default();
+    if !matches!(def, Definition::Module(_))
+        || !def
+            .items()
+            .iter()
+            .any(|it| matches!(it, ModuleItem::Defparam(_)))
+    {
+        return Ok(out);
+    }
+    let mut scopes = UpwardScopes::default();
+    scopes.declare(&def);
+    let declared = &scopes.declared[def.name()];
+    let full = if elab.name == crate::MULTI_TOP_WRAPPER {
+        prefix.trim_end_matches('.').to_string()
+    } else {
+        format!("{}.{}", elab.name, prefix)
+            .trim_end_matches('.')
+            .to_string()
+    };
+    let forced: HashSet<String> = crate::PARAM_OVERRIDES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|o| o.force && o.module.as_ref().is_none_or(|m| m == def.name()))
+        .map(|o| o.name.clone())
+        .collect();
+    let overridable: HashSet<&str> = def
+        .params()
+        .iter()
+        .chain(def.items().iter().filter_map(|it| match it {
+            ModuleItem::ParameterDeclaration(pd) if def.params().is_empty() => Some(pd),
+            _ => None,
+        }))
+        .filter(|pd| !pd.local)
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Data { assignments, .. } => assignments
+                .iter()
+                .map(|a| a.name.name.as_str())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let empty = HashMap::default();
+    for item in def.items() {
+        let ModuleItem::Defparam(assigns) = item else {
+            continue;
+        };
+        for (lhs, rhs) in assigns {
+            let path = defparam_path_segments(lhs).or_else(|| match &lhs.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    Some(vec![h.path[0].name.name.clone()])
+                }
+                _ => None,
+            });
+            let Some(mut path) = path else { continue };
+            let rooted = path.first().is_some_and(|s| s == "$root");
+            if rooted {
+                path.remove(0);
+            }
+            let Some(name) = path.last() else { continue };
+            let scope = path[..path.len() - 1].join(".");
+            if (scope != def.name() && scope.contains('['))
+                || (rooted && scope != full)
+                || (!rooted
+                    && !scope.is_empty()
+                    && (declared.contains(&path[0]) || (scope != def.name() && scope != full)))
+            {
+                continue;
+            }
+            if !overridable.contains(name.as_str()) {
+                crate::param_override_lists::check_defparam(elab, def, name, lhs.span, def.name())?;
+                continue;
+            }
+            out.remove(name);
+            let mut refs = Vec::new();
+            collect_ident_names(rhs, &mut refs);
+            if forced.contains(name)
+                || !refs.is_empty()
+                || !is_const_expr(rhs, &empty)
+                || !const_fn_expr_supported(rhs)
+            {
+                continue;
+            }
+            out.insert(name.clone(), rhs.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Extract the dotted instance/parameter path of a `defparam` LHS
 /// (`u.sub.PARAM` → `["u","sub","PARAM"]`). Returns None for anything that
 /// isn't a plain hierarchical identifier (bit-selects etc. are not valid
@@ -39845,6 +39975,7 @@ fn inline_module_items(
                 let inst_segs: Vec<&str> = hi.name.name.split('.').collect();
                 let n_inst = inst_segs.len();
                 let mut sub_defparams: Vec<PendingDefparam> = Vec::new();
+                let mut own = own_instance_defparams(elab, sub_mod, &inst_prefix)?;
                 for dp in &defparams {
                     let path = &dp.path;
                     if path.len() <= n_inst
@@ -39860,6 +39991,17 @@ fn inline_module_items(
                         crate::param_override_lists::check_defparam(
                             elab, sub_mod, &rest[0], dp.span, &dp.owner,
                         )?;
+                        // §23.10.1: the last defparam in the same source text
+                        // wins, including one written inside the target module.
+                        if let Some(local) = own.get(&rest[0]) {
+                            let same_file = ELAB_MODULE_FILES_TLS.with(|f| {
+                                let f = f.borrow();
+                                f.get(&dp.owner) == f.get(sub_mod.name())
+                            });
+                            if same_file && dp.span.start > local.span.start {
+                                own.remove(&rest[0]);
+                            }
+                        }
                         // Apply only if it is overridable (skip localparams,
                         // §6.20.4).
                         if overridable.contains(rest[0].as_str()) {
@@ -39881,6 +40023,11 @@ fn inline_module_items(
                             ..dp.clone()
                         });
                     }
+                }
+
+                for (name, rhs) in own {
+                    sub_params.insert(name.clone(), eval_const_expr_val(&rhs, &HashMap::default()));
+                    ovr_exprs.insert(name, rhs);
                 }
 
                 // A forced command-line override (`-GNAME=VALUE`) beats this
