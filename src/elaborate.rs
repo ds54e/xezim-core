@@ -4525,7 +4525,13 @@ impl ElaboratedModule {
             // needs the same per-element expansion — otherwise an array OUTPUT
             // PORT driven that way never propagates and the parent's array
             // stays x for the whole run.
-            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, self) {
+            if !expand_whole_array_assign(
+                &ca.lhs,
+                &ca.rhs,
+                ca.delay,
+                ca.delay_fall.is_none() && ca.delay_off.is_none() && ca.gate_delay_fall.is_none(),
+                self,
+            ) {
                 self.continuous_assigns.push(ca);
             }
         }
@@ -4566,6 +4572,8 @@ impl ElaboratedModule {
                 Some(&self.descending_arrays),
                 Some(&self.unpacked_decl_dims),
                 Some(&self.parameters),
+                Some(&self.arrays_2d),
+                ca.delay_fall.is_none() && ca.delay_off.is_none() && ca.gate_delay_fall.is_none(),
             )
             .or_else(|| {
                 slice_array_assign_parts(
@@ -14292,7 +14300,13 @@ pub fn elaborate_module_with_defs(
                         None => rhs.clone(),
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
+                    if !expand_whole_array_assign(
+                        lhs,
+                        &rhs_final,
+                        delay,
+                        delay_fall.is_none() && delay_off.is_none(),
+                        &mut elab,
+                    ) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
@@ -20151,7 +20165,13 @@ fn elaborate_items(
                         None => rhs.clone(),
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
+                    if !expand_whole_array_assign(
+                        lhs,
+                        &rhs_final,
+                        delay,
+                        delay_fall.is_none() && delay_off.is_none(),
+                        elab,
+                    ) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
@@ -50039,11 +50059,15 @@ pub fn whole_array_assign_parts_dir(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
 ) -> Option<Vec<ContinuousAssignment>> {
-    whole_array_assign_parts_dir_with_params(lhs, rhs, delay, arrays, descending, decl_dims, None)
+    whole_array_assign_parts_dir_with_params(
+        lhs, rhs, delay, arrays, descending, decl_dims, None, None, true,
+    )
 }
 
 /// §10.9.1: pattern keys and replication counts use the design's parameter
 /// bindings even when expansion happens after loading a compiled artifact.
+/// Slice targets require registered storage and no fall/turn-off delay.
+#[allow(clippy::too_many_arguments)]
 pub fn whole_array_assign_parts_dir_with_params(
     lhs: &Expression,
     rhs: &Expression,
@@ -50052,11 +50076,21 @@ pub fn whole_array_assign_parts_dir_with_params(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
     params: Option<&HashMap<String, Value>>,
+    arrays_2d: Option<&HashMap<String, ((i64, i64), (i64, i64), u32)>>,
+    slice_delay_free: bool,
 ) -> Option<Vec<ContinuousAssignment>> {
     let pattern = peel_unpacked_typed_pattern(rhs);
     if let ExprKind::AssignmentPattern(_) = &pattern.kind {
         return pattern_array_assign_parts(
-            lhs, pattern, delay, arrays, descending, decl_dims, params,
+            lhs,
+            rhs,
+            delay,
+            arrays,
+            descending,
+            decl_dims,
+            params,
+            arrays_2d,
+            slice_delay_free,
         );
     }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
@@ -50367,11 +50401,12 @@ pub fn whole_array_row_assign_parts(
 }
 
 /// §10.3 / §10.9: `assign arr = '{...};` — a continuous assignment of an
-/// assignment pattern to a whole unpacked array drives each element with
-/// its item: positional (`'{3, 4}`, the first item at the LEFT bound),
+/// assignment pattern to a whole unpacked array or a constant slice drives
+/// each element with its item: positional (`'{3, 4}`, the first item at the LEFT bound),
 /// replicated (`'{2{x}}`), index-keyed and `default:`, nested one pattern
 /// per dimension (`'{'{1, 2}, '{3, 4}}`). Other shapes (named or typed
 /// keys, an element that is itself an aggregate) are left as they were.
+#[allow(clippy::too_many_arguments)]
 fn pattern_array_assign_parts(
     lhs: &Expression,
     rhs: &Expression,
@@ -50380,15 +50415,26 @@ fn pattern_array_assign_parts(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
     params: Option<&HashMap<String, Value>>,
+    arrays_2d: Option<&HashMap<String, ((i64, i64), (i64, i64), u32)>>,
+    slice_delay_free: bool,
 ) -> Option<Vec<ContinuousAssignment>> {
-    let ExprKind::Ident(lh) = &lhs.kind else {
+    let (base, slice) = match &lhs.kind {
+        ExprKind::RangeSelect {
+            expr,
+            kind,
+            left,
+            right,
+        } if delay == 0 && slice_delay_free => (expr.as_ref(), Some((kind, left, right))),
+        _ => (lhs, None),
+    };
+    let ExprKind::Ident(lh) = &base.kind else {
         return None;
     };
     if lh.path.len() != 1 || !lh.path[0].selects.is_empty() {
         return None;
     }
     let ln = &lh.path[0].name.name;
-    let dims: Vec<(i64, i64)> = match decl_dims.and_then(|d| d.get(ln)) {
+    let mut dims: Vec<(i64, i64)> = match decl_dims.and_then(|d| d.get(ln)) {
         Some(d) if !d.is_empty() => d.clone(),
         _ => {
             let &(lo, hi, _) = arrays.get(ln)?;
@@ -50399,6 +50445,45 @@ fn pattern_array_assign_parts(
             }
         }
     };
+    // §7.4.6 / §7.6 / §10.9.1: a slice is an unpacked array; bind
+    // pattern items over its selected outer range, retaining inner dimensions.
+    // Nonconstant, out-of-range and delayed targets keep their existing path.
+    if let Some((kind, left, right)) = slice {
+        // Dimensions alone do not establish element storage (e.g. a net
+        // declared in a generate block). Admit only registered arrays.
+        match dims.len() {
+            1 if arrays.contains_key(ln) => {}
+            2 if arrays_2d.is_some_and(|a| a.contains_key(ln)) => {}
+            _ => return None,
+        }
+        let known = |e: &Expression| {
+            let empty = HashMap::default();
+            if eval_const_expr_val(e, params.unwrap_or(&empty)).has_xz() {
+                return None;
+            }
+            const_eval_i64_with_params(e, params)
+        };
+        let (a, b) = (known(left)?, known(right)?);
+        let (dl, dr) = dims[0];
+        let (l, r) = match kind {
+            RangeKind::Constant => (a, b),
+            RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                if b <= 0 || b > 4096 {
+                    return None;
+                }
+                let (lo, hi) = if matches!(kind, RangeKind::IndexedUp) {
+                    (a, a.checked_add(b - 1)?)
+                } else {
+                    (a.checked_sub(b - 1)?, a)
+                };
+                if dl > dr { (hi, lo) } else { (lo, hi) }
+            }
+        };
+        if l.min(r) < dl.min(dr) || l.max(r) > dl.max(dr) || (l != r && (l > r) != (dl > dr)) {
+            return None;
+        }
+        dims[0] = (l, r);
+    }
     let total: i64 = dims
         .iter()
         .map(|&(l, r)| (l - r).abs() + 1)
@@ -50407,7 +50492,14 @@ fn pattern_array_assign_parts(
         return None;
     }
     let mut out: Vec<(Vec<i64>, Expression)> = Vec::new();
-    pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out, params)?;
+    pattern_leaves(
+        rhs,
+        &dims,
+        &mut Vec::new(),
+        &mut out,
+        params,
+        slice.is_none(),
+    )?;
     Some(
         out.into_iter()
             .map(|(idx, e)| ContinuousAssignment {
@@ -50433,6 +50525,7 @@ fn pattern_leaves(
     idx: &mut Vec<i64>,
     out: &mut Vec<(Vec<i64>, Expression)>,
     params: Option<&HashMap<String, Value>>,
+    allow_typed: bool,
 ) -> Option<()> {
     let Some(&(l, r)) = dims.first() else {
         if matches!(e.kind, ExprKind::AssignmentPattern(_)) {
@@ -50441,6 +50534,12 @@ fn pattern_leaves(
         out.push((idx.clone(), e.clone()));
         return Some(());
     };
+    // §10.9.1 / §7.6: typed array patterns bind to their own bounds.
+    // Slice expansion takes context only from untyped patterns, at every
+    // dimension; whole-array callers retain their existing typed path.
+    if !allow_typed && !matches!(e.kind, ExprKind::AssignmentPattern(_)) {
+        return None;
+    }
     let ExprKind::AssignmentPattern(items) = &peel_unpacked_typed_pattern(e).kind else {
         return None;
     };
@@ -50490,7 +50589,7 @@ fn pattern_leaves(
     for (k, x) in elems.into_iter().enumerate() {
         idx.push(index_at(k));
         match (x, default) {
-            (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out, params)?,
+            (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out, params, allow_typed)?,
             // §10.9.1: `default:` reaches every leaf of a missing element.
             (None, Some(d))
                 if !matches!(
@@ -50500,7 +50599,7 @@ fn pattern_leaves(
             {
                 default_leaves(d, &dims[1..], idx, out)
             }
-            (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out, params)?,
+            (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out, params, allow_typed)?,
             (None, None) => return None,
         }
         idx.pop();
@@ -50550,6 +50649,7 @@ fn expand_whole_array_assign(
     lhs: &Expression,
     rhs: &Expression,
     delay: u64,
+    slice_delay_free: bool,
     elab: &mut ElaboratedModule,
 ) -> bool {
     match whole_array_assign_parts_dir_with_params(
@@ -50560,6 +50660,8 @@ fn expand_whole_array_assign(
         Some(&elab.descending_arrays),
         Some(&elab.unpacked_decl_dims),
         Some(&elab.parameters),
+        Some(&elab.arrays_2d),
+        slice_delay_free,
     )
     .or_else(|| {
         slice_array_assign_parts(
