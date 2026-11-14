@@ -44,7 +44,9 @@ struct Entry {
     value: Option<Value>,
 }
 #[derive(Default)]
-pub(super) struct Types(HashMap<usize, Entry>);
+// None outside a real function; nested calls inherit the whole host's
+// admission. This is private evaluation state, never serialized.
+pub(super) struct Types(HashMap<usize, Entry>, pub(super) Option<bool>);
 impl Types {
     pub fn take_value(&mut self, expr: &Expression) -> Option<Value> {
         self.0.get_mut(&(expr as *const _ as usize))?.value.take()

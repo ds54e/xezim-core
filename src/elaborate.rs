@@ -23899,7 +23899,11 @@ pub fn const_eval_i64_with_params(
         // $min/$max take two args. Real math reaches integer dimensions
         // through $rtoi, retaining each operand's packed width (§20.5).
         ExprKind::SystemCall { name, args } => match name.as_str() {
-            "$rtoi" if args.len() == 1 && const_fn_expr_supported(&args[0]) => {
+            "$rtoi"
+                if args.len() == 1
+                    && (const_fn_expr_supported(&args[0])
+                        || const_fn_expr_supported_inner(&args[0], params)) =>
+            {
                 let empty = HashMap::default();
                 eval_const_expr_val(expr, params.unwrap_or(&empty)).to_i64()
             }
@@ -29746,6 +29750,24 @@ pub fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &s
     ));
 }
 
+// §20.5 / §20.8.2: only these callers opt into real-to-integral named
+// casts. An unsupported whole argument list keeps every nested call on main's
+// path; an admitted list is checked once, before any operand is evaluated.
+fn const_real_cast_scope(
+    args: &[Expression],
+    params: &HashMap<String, Value>,
+    types: &mut const_context::Types,
+) -> Option<bool> {
+    let saved = types.1;
+    if saved.is_none() {
+        types.1 = Some(
+            args.iter()
+                .all(|a| const_fn_expr_supported_inner(a, Some(params))),
+        );
+    }
+    saved
+}
+
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
 /// §11.8.2: a constant integral operand that takes REAL type from its context
 /// (the other side of a relational operator, the other arm of `?:`). The real
@@ -30300,7 +30322,9 @@ fn eval_const_expr_val_inner(
                     | "$bitstoshortreal"
             ) && args.len() == 1 =>
         {
+            let saved = const_real_cast_scope(args, params, types);
             let v = eval_const_expr_val_inner(&args[0], params, types);
+            types.1 = saved;
             let f = v.to_f64();
             match name.as_str() {
                 // $rtoi TRUNCATES toward zero (unlike an assignment to int,
@@ -30314,6 +30338,7 @@ fn eval_const_expr_val_inner(
             }
         }
         ExprKind::SystemCall { name, args } if const_real_math_arity(name) == Some(args.len()) => {
+            let saved = const_real_cast_scope(args, params, types);
             let a = eval_const_expr_val_inner(&args[0], params, types).to_f64();
             let mut b = || eval_const_expr_val_inner(&args[1], params, types).to_f64();
             let result = match name.as_str() {
@@ -30340,6 +30365,7 @@ fn eval_const_expr_val_inner(
                 "$acosh" => a.acosh(),
                 _ => a.atanh(),
             };
+            types.1 = saved;
             Value::from_f64(result)
         }
         ExprKind::SystemCall { name, args } if name == "$__xz_size_cast" && args.len() == 2 => {
@@ -30398,11 +30424,22 @@ fn eval_const_expr_val_inner(
                 // §6.24.1 TYPE cast to an integral typedef: the value takes the
                 // typedef's width and signing, and the target is the operand's
                 // context, as for a keyword type cast below.
-                if let Some((w, signed)) = const_typedef_cast_target(&nm, scoped.as_deref(), params)
+                if let Some((w, signed)) =
+                    const_typedef_cast_target(&nm, scoped.as_deref(), params, false)
                 {
                     let v = eval_const_expr_val_ctx_inner(&args[1], params, w, types);
-                    if !v.is_real {
-                        let mut out = v.resize(w);
+                    // §6.24.1 / §6.12.1: an integral typedef rounds a real
+                    // operand just like the keyword type cast below. Do not
+                    // pass the real through to a surrounding $rtoi (§20.5).
+                    if !v.is_real
+                        || (types.1 == Some(true)
+                            && const_typedef_cast_target(&nm, scoped.as_deref(), params, true).is_some())
+                    {
+                        let mut out = if v.is_real {
+                            Value::from_real_wrapped(v.to_f64(), w)
+                        } else {
+                            v.resize(w)
+                        };
                         out.is_signed = signed;
                         return out;
                     }
@@ -31014,6 +31051,7 @@ fn const_typedef_cast_target(
     nm: &str,
     scoped: Option<&str>,
     params: &HashMap<String, Value>,
+    exact_width: bool,
 ) -> Option<(u32, bool)> {
     let local = |n: &str| CONST_FN_LOCAL_TYPES.with(|c| c.borrow().as_ref()?.get(n).cloned());
     let dt = TYPEDEF_SHAPES_TLS.with(|sh| {
@@ -31051,7 +31089,9 @@ fn const_typedef_cast_target(
         DataType::Struct(s) => s.packed,
         _ => false,
     };
-    if !integral {
+    // A cached fallback width is sufficient for the original integral path,
+    // but must not truncate a newly converted real (§6.24.1).
+    if !integral || (exact_width && !const_fn_cast_type_static(&dt, Some(params))) {
         return None;
     }
     let own = scoped.is_none() && local(nm).is_some();
@@ -31065,6 +31105,13 @@ fn const_typedef_cast_target(
         .unwrap_or_else(|| {
             TYPEDEFS_TLS.with(|c| resolve_type_width(&dt, Some(params), c.borrow().as_ref()))
         });
+    if exact_width
+        && (w >= SANE_MAX_PACKED_WIDTH
+            || w != TYPEDEFS_TLS
+                .with(|c| resolve_type_width(&dt, Some(params), c.borrow().as_ref())))
+    {
+        return None;
+    }
     (w > 0).then(|| (w, is_type_signed(&dt)))
 }
 
@@ -46847,28 +46894,42 @@ fn eval_const_user_function(
 /// whole const-fn evaluation so the parameter falls back to sim-time
 /// deferral rather than silently computing a wrong value.
 fn const_fn_expr_supported(e: &Expression) -> bool {
+    const_fn_expr_supported_inner(e, None)
+}
+
+// Only the added real-function and dimension paths opt into typedef resolution;
+// constant-function support checks retain their existing deferral policy.
+fn const_fn_expr_supported_inner(
+    e: &Expression,
+    typedef_params: Option<&HashMap<String, Value>>,
+) -> bool {
     use crate::ast::expr::{BinaryOp, UnaryOp};
+    let supported = |e: &Expression| const_fn_expr_supported_inner(e, typedef_params);
+    // The added path must not turn an unresolved value into zero. Calls and
+    // selects and identifiers can fall back in the value evaluator.
+    // The original check above keeps its policy.
+    if typedef_params.is_some() {
+        match &e.kind {
+            ExprKind::Call { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. } => return false,
+            ExprKind::Ident(_) => return false,
+            _ => {}
+        }
+    }
     match &e.kind {
         ExprKind::Number(_) => true,
         // 1 segment: local/param. 2 segments: a SCOPED package param
         // (`q::DEPTH`) — eval_const_expr_val resolves it via the `q::DEPTH`
         // alias, so `LOG2(q::DEPTH)` args are safe to admit.
         ExprKind::Ident(h) => {
-            h.path.len() <= 2
-                && h.path
-                    .iter()
-                    .all(|seg| seg.selects.iter().all(const_fn_expr_supported))
+            h.path.len() <= 2 && h.path.iter().all(|seg| seg.selects.iter().all(supported))
         }
-        ExprKind::Index { expr, index } => {
-            const_fn_expr_supported(expr) && const_fn_expr_supported(index)
-        }
+        ExprKind::Index { expr, index } => supported(expr) && supported(index),
         ExprKind::RangeSelect {
             expr, left, right, ..
-        } => {
-            const_fn_expr_supported(expr)
-                && const_fn_expr_supported(left)
-                && const_fn_expr_supported(right)
-        }
+        } => supported(expr) && supported(left) && supported(right),
         // `q::DEPTH` also parses as MemberAccess{Ident(q), DEPTH};
         // eval_const_expr_val resolves it through the scoped alias (and falls
         // back to struct-param field slicing, also supported).
@@ -46880,40 +46941,28 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
             expr: base,
             member: _,
         } => match &base.kind {
-            ExprKind::Ident(h)
-                if h.path.len() == 1 && h.path[0].selects.is_empty() =>
-            {
-                true
-            }
-            ExprKind::Index { .. } => const_fn_expr_supported(base),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => true,
+            ExprKind::Index { .. } => supported(base),
             _ => false,
         },
-        ExprKind::Paren(i) => const_fn_expr_supported(i),
+        ExprKind::Paren(i) => supported(i),
         ExprKind::Unary { op, operand } => {
             !matches!(
                 op,
                 UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
-            ) && const_fn_expr_supported(operand)
+            ) && supported(operand)
         }
         ExprKind::Binary { op, left, right } => {
-            !matches!(op, BinaryOp::Assign)
-                && const_fn_expr_supported(left)
-                && const_fn_expr_supported(right)
+            !matches!(op, BinaryOp::Assign) && supported(left) && supported(right)
         }
         ExprKind::Conditional {
             condition,
             then_expr,
             else_expr,
-        } => {
-            const_fn_expr_supported(condition)
-                && const_fn_expr_supported(then_expr)
-                && const_fn_expr_supported(else_expr)
-        }
-        ExprKind::Concatenation(items) => items.iter().all(const_fn_expr_supported),
-        ExprKind::Replication { count, exprs } => {
-            const_fn_expr_supported(count) && exprs.iter().all(const_fn_expr_supported)
-        }
-        ExprKind::Call { args, .. } => args.iter().all(const_fn_expr_supported),
+        } => supported(condition) && supported(then_expr) && supported(else_expr),
+        ExprKind::Concatenation(items) => items.iter().all(supported),
+        ExprKind::Replication { count, exprs } => supported(count) && exprs.iter().all(supported),
+        ExprKind::Call { args, .. } => args.iter().all(supported),
         // §6.24.1: `signed'(e)` / `unsigned'(e)` reach here lowered onto
         // `$signed` / `$unsigned`. They only REINTERPRET signedness — no width
         // is resolved and no type table is consulted — so `eval_const_expr_val`
@@ -46930,16 +46979,62 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
         // already replaced by its declared type
         // (`resolve_const_fn_cast_targets`); one that could not be resolved
         // (`$__xz_named_cast`, a type reference) still bails.
+        // §6.24.1: admit a named integral cast only when the same resolver
+        // used by the value evaluator knows its width and signing.
+        ExprKind::SystemCall { name, args }
+            if name == "$__xz_named_cast" && args.len() == 2 && typedef_params.is_some() =>
+        {
+            let target = match &args[0].kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    Some((h.path[0].name.name.clone(), None))
+                }
+                ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 => Some((
+                        member.name.clone(),
+                        Some(format!("{}::{}", h.path[0].name.name, member.name)),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            };
+            target.is_some_and(|(nm, scoped)| {
+                let params = typedef_params.unwrap();
+                !params.contains_key(scoped.as_deref().unwrap_or(&nm))
+                    && !params.contains_key(&nm)
+                    && const_typedef_cast_target(&nm, scoped.as_deref(), params, true).is_some()
+            }) && supported(&args[1])
+        }
         ExprKind::SystemCall { name, args } if name == "$__xz_size_cast" => {
-            args.len() == 2 && args.iter().all(const_fn_expr_supported)
+            args.len() == 2 && args.iter().all(supported)
         }
         ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" => {
             args.len() == 2
-                && matches!(&args[0].kind, ExprKind::TypeLiteral(dt) if const_fn_cast_type_static(dt))
-                && const_fn_expr_supported(&args[1])
+                && matches!(&args[0].kind, ExprKind::TypeLiteral(dt)
+                    if (typedef_params.is_none() && const_fn_cast_type_static(dt, None))
+                        || (typedef_params.is_some() && matches!(dt.as_ref(),
+                            DataType::Real { kind: RealType::Real | RealType::RealTime, .. })))
+                && supported(&args[1])
+        }
+        ExprKind::SystemCall { name, args }
+            if typedef_params.is_some()
+                && matches!(name.as_str(), "$itor" | "$bitstoreal" | "$bitstoshortreal") =>
+        {
+            args.len() == 1
+                && matches!(&args[0].kind, ExprKind::SystemCall { name: inner, .. }
+                if match name.as_str() {
+                    "$itor" => inner == "$__xz_named_cast",
+                    "$bitstoreal" => inner == "$realtobits"
+                        || (inner == "$__xz_named_cast"
+                            && const_cast_bits(&args[0], typedef_params.unwrap()) == Some(64)),
+                    _ => inner == "$shortrealtobits"
+                        || (inner == "$__xz_named_cast"
+                            && const_cast_bits(&args[0], typedef_params.unwrap()) == Some(32)),
+                })
+                && supported(&args[0])
         }
         ExprKind::SystemCall { name, args } => {
-            (matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned")
+            ((typedef_params.is_none()
+                && matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned"))
                 || (matches!(
                     name.as_str(),
                     "$rtoi"
@@ -46950,7 +47045,7 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
                         | "$bitstoshortreal"
                 ) && args.len() == 1)
                 || const_real_math_arity(name) == Some(args.len()))
-                && args.iter().all(const_fn_expr_supported)
+                && args.iter().all(supported)
         }
         _ => false,
     }
@@ -46960,19 +47055,39 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
 /// itself: an integer atom, or an integer vector or enum whose dimension
 /// bounds `const_fn_expr_supported` admits. Anything naming another type
 /// (a type reference, a struct member type) would need the width table.
-fn const_fn_cast_type_static(dt: &DataType) -> bool {
+fn const_fn_cast_type_static(dt: &DataType, params: Option<&HashMap<String, Value>>) -> bool {
+    let bound_ok = |e: &Expression| {
+        const_fn_expr_supported_inner(e, params)
+            && params.is_none_or(|p| {
+                matches!(e.kind, ExprKind::Number(NumberLiteral::Integer { .. }))
+                    && const_eval_i64_with_params(e, Some(p)).is_some_and(|n| {
+                        if n.unsigned_abs() > SANE_MAX_PACKED_WIDTH as u64 {
+                            return false;
+                        }
+                        let v = eval_const_expr_val(e, p);
+                        v.width <= 64 && !v.has_xz() && v.to_i64() == Some(n)
+                    })
+            })
+    };
     let dims_ok = |dims: &[PackedDimension]| {
         dims.iter().all(|d| {
             matches!(d, PackedDimension::Range { left, right, .. }
-                if const_fn_expr_supported(left) && const_fn_expr_supported(right))
+                if bound_ok(left) && bound_ok(right))
         })
     };
     match dt {
         DataType::IntegerAtom { .. } => true,
         DataType::IntegerVector { dimensions, .. } => dims_ok(dimensions),
         DataType::Enum(e) => {
-            dims_ok(&e.dimensions) && e.base_type.as_deref().is_none_or(const_fn_cast_type_static)
+            dims_ok(&e.dimensions)
+                && e.base_type
+                    .as_deref()
+                    .is_none_or(|dt| const_fn_cast_type_static(dt, params))
         }
+        DataType::Struct(s) if params.is_some() && s.packed => s.members.iter().all(|m| {
+            const_fn_cast_type_static(&m.data_type, params)
+                && m.declarators.iter().all(|d| d.dimensions.is_empty())
+        }),
         _ => false,
     }
 }
