@@ -3852,7 +3852,8 @@ pub struct ElaboratedModule {
     /// inside a package subroutine in ITS package when two packages contest
     /// the name.
     pub pkg_subr_owner: HashMap<String, String>,
-    /// §26.3: every scalar package variable under its QUALIFIED name
+    /// §26.3: scalar package variables and contested fixed-array storage
+    /// anchors under their QUALIFIED names
     /// (`pkg::name`), with its declared type and initial value. Package
     /// variables are hoisted into `signals` under their bare name, which two
     /// packages declaring the same name — or a module-scope declaration of
@@ -33614,6 +33615,25 @@ fn inline_instantiations_inner(
             elab.def_pkg_imports.insert(name.clone(), imports);
         }
     }
+    // §26.3: count package data owners once, as the scalar storage splitter
+    // does. Uncontested arrays keep their existing bare registration.
+    let mut package_data_owners: HashMap<&str, (usize, bool)> = HashMap::default();
+    for def in definitions.values() {
+        if let Definition::Package(pkg) = def {
+            for item in &pkg.items {
+                if let PackageItem::Data(dd) = item {
+                    for decl in &dd.declarators {
+                        let (count, nettype) =
+                            package_data_owners.entry(&decl.name.name).or_default();
+                        *count += 1;
+                        // §6.6.7: user nettypes retain their driver-folding path.
+                        *nettype |= get_type_name(&dd.data_type)
+                            .is_some_and(|tn| elab.nettype_resolvers.contains_key(&tn));
+                    }
+                }
+            }
+        }
+    }
     // Populate class and covergroup definitions from global scope
     for (name, def) in definitions {
         match def {
@@ -34015,6 +34035,72 @@ fn inline_instantiations_inner(
                                     }
                                     _ => decl,
                                 };
+                                // §23.9/§26.3: a fixed package array displaced by a
+                                // local declaration or another package owns qualified
+                                // storage, just as a contested scalar does. Register
+                                // its shape, element type and initializers together;
+                                // the existing package resolver then uses these cells.
+                                let owned_decl;
+                                let decl = if let Some(dims) =
+                                    declared_unpacked_dims(&decl.dimensions, &elab.parameters)
+                                    && package_data_owners
+                                        .get(decl.name.name.as_str())
+                                        .is_some_and(|(n, nettype)| {
+                                            !nettype
+                                                && (elab.local_decl_displaces(&decl.name.name)
+                                                    || *n > 1)
+                                        }) {
+                                    let mut d = decl.clone();
+                                    d.name.name = format!("{}::{}", name, decl.name.name);
+                                    let q = &d.name.name;
+                                    register_packed_param_index(elab, q, &dd.data_type, None);
+                                    register_member_packed_meta(elab, q, &dd.data_type, None);
+                                    // §7.2/§26.3: use the module-array member
+                                    // registration for the resolved package store.
+                                    if matches!(resolve_typedef_chain(&dd.data_type, &elab.typedef_types), DataType::Struct(su) if !su.packed)
+                                        && dims
+                                            .iter()
+                                            .try_fold(1u64, |n, (l, r)| {
+                                                n.checked_mul(l.abs_diff(*r).checked_add(1)?)
+                                            })
+                                            .is_some_and(|n| n <= 4096)
+                                    {
+                                        let shape: Vec<_> = dims
+                                            .iter()
+                                            .map(|&(l, r)| (l.min(r), l.max(r)))
+                                            .collect();
+                                        for suffix in index_tuples(&shape) {
+                                            register_unpacked_aggregate(
+                                                elab,
+                                                &format!("{q}{suffix}"),
+                                                &dd.data_type,
+                                            );
+                                        }
+                                    }
+                                    if dd.net_type.is_some() {
+                                        mark_array_z_init_if_4state(elab, q, &dd.data_type);
+                                    }
+                                    elab.pkg_var_decls.insert(
+                                        d.name.name.clone(),
+                                        Signal {
+                                            is_const: false,
+                                            name: d.name.name.clone().into(),
+                                            width,
+                                            is_signed,
+                                            is_real: is_type_real_resolved(
+                                                &dd.data_type,
+                                                &elab.typedef_types,
+                                            ),
+                                            direction: None,
+                                            value: Value::zero(width),
+                                            type_name: get_type_name(&dd.data_type),
+                                        },
+                                    );
+                                    owned_decl = d;
+                                    &owned_decl
+                                } else {
+                                    decl
+                                };
                                 // §10.9.1: package array patterns need the same
                                 // element type and declared bounds as module arrays.
                                 if !decl.dimensions.is_empty() {
@@ -34159,6 +34245,13 @@ fn inline_instantiations_inner(
                                         elab.var_decl_types
                                             .insert(name.clone(), dd.data_type.clone());
                                         if let Some(init_expr) = &decl.init {
+                                            let q = if name.contains("::") {
+                                                name.clone()
+                                            } else {
+                                                format!("{}::{name}", p.name.name)
+                                            };
+                                            elab.pkg_var_init_blocks
+                                                .push((elab.static_init_blocks.len(), q));
                                             elab.static_init_blocks.push(InitialBlock {
                                                 stmt: Statement::new(
                                                     StatementKind::BlockingAssign {
@@ -34422,6 +34515,7 @@ fn inline_instantiations_inner(
                                 let Some(init_expr) = &decl.init else {
                                     continue;
                                 };
+                                let init_start = elab.static_init_blocks.len();
                                 let init_items: Vec<&Expression> =
                                     match &peel_unpacked_typed_pattern(init_expr).kind {
                                         ExprKind::AssignmentPattern(items) => {
@@ -34516,6 +34610,14 @@ fn inline_instantiations_inner(
                                         ),
                                         scope: String::new(),
                                     });
+                                }
+                                if elab.static_init_blocks.len() > init_start {
+                                    let q = if decl.name.name.contains("::") {
+                                        decl.name.name.clone()
+                                    } else {
+                                        format!("{name}::{}", decl.name.name)
+                                    };
+                                    elab.pkg_var_init_blocks.push((init_start, q));
                                 }
                             }
                         }
@@ -34656,6 +34758,7 @@ fn inline_instantiations_inner(
     // (the reference simulators report `Illegal access to local/protected
     // member` at elaboration). Only accesses proven illegal are rejected.
     validate_member_visibility(elab)?;
+    crate::pkg_scope::qualify_split_array_refs(elab, definitions);
 
     Ok(())
 }

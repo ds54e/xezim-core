@@ -84,7 +84,10 @@ struct PkgInfo {
     exports: Vec<(String, Option<String>)>,
 }
 
+#[derive(Default)]
 struct Info {
+    /// The post-elaboration pass also sees absolute port actuals.
+    split_arrays: bool,
     pkgs: HashMap<String, PkgInfo>,
     /// Type names declared by a package AND somewhere else.
     colliding: HashSet<String>,
@@ -883,6 +886,319 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
     }
 }
 
+/// §26.3: apply the lexical package resolver to exactly the fixed arrays
+/// whose storage elaboration split. All consumers receive the same anchor.
+pub(crate) fn qualify_split_array_refs(
+    elab: &mut crate::elaborate::ElaboratedModule,
+    definitions: &HashMap<String, crate::elaborate::Definition<'_>>,
+) {
+    let mut info = Info {
+        split_arrays: true,
+        ..Info::default()
+    };
+    for q in elab.pkg_var_decls.keys() {
+        if (elab.arrays.contains_key(q)
+            || elab.arrays_2d.contains_key(q)
+            || elab.arrays_nd.contains_key(q))
+            && let Some((p, n)) = q.split_once("::")
+        {
+            info.mangled_vars.insert(n.to_string());
+            info.pkgs
+                .entry(p.to_string())
+                .or_default()
+                .vars
+                .insert(n.to_string());
+        }
+    }
+    if info.mangled_vars.is_empty() {
+        return;
+    }
+    let mut scopes = HashMap::default();
+    for (name, def) in definitions {
+        let mut f = Rw::module_frame(def.params(), def.ports(), def.items());
+        for item in def.items() {
+            if let ModuleItem::ImportDeclaration(i) = item {
+                f.add_imports(i);
+            }
+        }
+        if let crate::elaborate::Definition::Package(p) = def {
+            f.pkg = Some(name.clone());
+            let pi = info.pkgs.entry(name.clone()).or_default();
+            for item in &p.items {
+                package_item_values(item, &mut pi.values);
+                match item {
+                    PackageItem::Import(i) => {
+                        f.add_imports(i);
+                        for ii in &i.items {
+                            if let Some(n) = &ii.item {
+                                pi.explicit.push((ii.package.name.clone(), n.name.clone()));
+                            } else {
+                                pi.wild.push(ii.package.name.clone());
+                            }
+                        }
+                    }
+                    PackageItem::Export(i) => pi.exports.extend(i.items.iter().map(|ii| {
+                        (
+                            ii.package.name.clone(),
+                            ii.item.as_ref().map(|n| n.name.clone()),
+                        )
+                    })),
+                    _ => {}
+                }
+            }
+        }
+        scopes.insert(name.clone(), f);
+    }
+    for (name, c) in &elab.classes {
+        info.classes.insert(
+            name.clone(),
+            ClassInfo {
+                values: c
+                    .properties
+                    .keys()
+                    .chain(c.methods.keys())
+                    .cloned()
+                    .collect(),
+                base: c.extends.clone(),
+                ..ClassInfo::default()
+            },
+        );
+    }
+    elab.materialize_pending();
+    // Move, rather than clone, a definition's frame between bodies. Large
+    // packages with many subroutines stay linear in declarations + references.
+    let mut rw = Rw {
+        info: &info,
+        frames: vec![Frame::default()],
+        errors: Vec::new(),
+        in_const: 0,
+        inline_depth: 0,
+    };
+    let mut active = String::new();
+    let mut enter = |rw: &mut Rw<'_>, owner: &str| {
+        if active != owner {
+            scopes.insert(
+                std::mem::take(&mut active),
+                std::mem::take(&mut rw.frames[0]),
+            );
+            rw.frames[0] = scopes.remove(owner).unwrap_or_default();
+            active = owner.to_string();
+        }
+    };
+    let instances: HashMap<_, _> = elab
+        .instances
+        .iter()
+        .map(|i| (i.path.as_str(), i.def_name.as_str()))
+        .collect();
+    let scope_owner = |scope: &str| {
+        let mut scope = scope;
+        loop {
+            if let Some(def) = instances.get(scope) {
+                break *def;
+            }
+            match scope.rsplit_once('.') {
+                Some((p, _)) => scope = p,
+                None => break elab.name.as_str(),
+            }
+        }
+    };
+    for block in elab
+        .initial_blocks
+        .iter_mut()
+        .chain(&mut elab.final_blocks)
+        .chain(&mut elab.program_initial_blocks)
+    {
+        enter(&mut rw, scope_owner(&block.scope));
+        rw.body(&mut block.stmt);
+    }
+    for block in &mut elab.always_blocks {
+        enter(&mut rw, scope_owner(&block.scope));
+        rw.body(&mut block.stmt);
+    }
+    for assign in &mut elab.continuous_assigns {
+        enter(
+            &mut rw,
+            scope_owner(assign.origin.as_ref().map_or("", |(_, s)| s)),
+        );
+        rw.expr(&mut assign.lhs);
+        rw.expr(&mut assign.rhs);
+    }
+    // The remaining flattened runtime expressions have the same namespace
+    // as continuous assignments. Keep the declaration frame for named bodies.
+    enter(&mut rw, &elab.name);
+    for t in &mut elab.tran_switches {
+        rw.expr(&mut t.a);
+        rw.expr(&mut t.b);
+        rw.opt(&mut t.ctl);
+    }
+    for u in &mut elab.udp_instances {
+        rw.expr(&mut u.output);
+        u.inputs.iter_mut().for_each(|e| rw.expr(e));
+    }
+    for (_, e, _) in &mut elab.input_port_actuals {
+        rw.expr(e);
+    }
+    for paths in elab.module_paths.values_mut() {
+        for p in paths {
+            rw.opt(&mut p.cond);
+        }
+    }
+    for tc in &mut elab.timing_checks {
+        enter(&mut rw, &tc.def_name);
+        for a in tc.args.iter_mut().flatten() {
+            rw.expr(&mut a.expr);
+            rw.opt(&mut a.cond);
+        }
+    }
+    let decl_owner = |name: &str| {
+        name.split_once("::")
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| {
+                scope_owner(name.rsplit_once('.').map_or("", |(p, _)| p)).to_string()
+            })
+    };
+    for (name, e) in &mut elab.assoc_defaults {
+        enter(&mut rw, &decl_owner(name));
+        rw.expr(e);
+    }
+    for (name, e) in &mut elab.property_decls {
+        enter(&mut rw, &decl_owner(name));
+        rw.frames.push(Frame {
+            values: elab
+                .property_params
+                .get(name)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            ..Frame::default()
+        });
+        rw.expr(e);
+        rw.frames.pop();
+    }
+    for (name, l) in &mut elab.lets {
+        enter(&mut rw, &decl_owner(name));
+        rw.frames.push(Rw::module_frame(&[], &l.ports, &[]));
+        rw.expr(&mut l.expr);
+        rw.frames.pop();
+    }
+    for (name, cg) in &mut elab.covergroups {
+        enter(&mut rw, &decl_owner(name));
+        rw.covergroup(cg);
+    }
+    for (name, cd) in &mut elab.clocking_blocks {
+        enter(&mut rw, &decl_owner(name));
+        rw.opt(&mut cd.default_input_skew);
+        rw.opt(&mut cd.default_output_skew);
+        for s in &mut cd.signals {
+            rw.opt(&mut s.skew);
+            rw.opt(&mut s.bound_to);
+        }
+        cd.items.iter_mut().for_each(|s| rw.stmt(s));
+    }
+    let init_owners: HashMap<_, _> = elab
+        .pkg_var_init_blocks
+        .iter()
+        .filter_map(|(i, q)| q.split_once("::").map(|(p, _)| (*i, p)))
+        .collect();
+    for (i, block) in elab.static_init_blocks.iter_mut().enumerate() {
+        enter(
+            &mut rw,
+            init_owners
+                .get(&i)
+                .copied()
+                .unwrap_or_else(|| scope_owner(&block.scope)),
+        );
+        rw.body(&mut block.stmt);
+    }
+    // §23.9 / §26.3: the bare subroutine can instead be a module declaration.
+    // Match its qualified registration, as constant-function ownership does.
+    let subr_owners: HashMap<_, _> = elab
+        .pkg_subr_owner
+        .iter()
+        .filter(|(n, p)| {
+            let q = format!("{p}::{n}");
+            elab.functions
+                .get(*n)
+                .zip(elab.functions.get(&q))
+                .is_some_and(|(a, b)| a.span == b.span)
+                || elab
+                    .tasks
+                    .get(*n)
+                    .zip(elab.tasks.get(&q))
+                    .is_some_and(|(a, b)| a.span == b.span)
+        })
+        .collect();
+    for name in elab.functions.keys().cloned().collect::<Vec<_>>() {
+        let owner = name
+            .split_once("::")
+            .map(|(p, _)| p)
+            .or_else(|| subr_owners.get(&name).map(|p| p.as_str()));
+        enter(
+            &mut rw,
+            owner.unwrap_or_else(|| scope_owner(name.rsplit_once('.').map_or("", |(s, _)| s))),
+        );
+        if let Some(mut f) = elab.functions.remove(&name) {
+            rw.function(&mut f);
+            elab.functions.insert(name, f);
+        }
+    }
+    for (name, t) in &mut elab.tasks {
+        let owner = name
+            .split_once("::")
+            .map(|(p, _)| p)
+            .or_else(|| subr_owners.get(name).map(|p| p.as_str()));
+        enter(
+            &mut rw,
+            owner.unwrap_or_else(|| scope_owner(name.rsplit_once('.').map_or("", |(s, _)| s))),
+        );
+        rw.task(t);
+    }
+    for (name, c) in &mut elab.classes {
+        let owner = name
+            .split_once("::")
+            .map(|(p, _)| p)
+            .or_else(|| elab.class_decl_pkg.get(name).map(String::as_str));
+        let c = std::sync::Arc::make_mut(c);
+        let frame = Frame {
+            values: c
+                .properties
+                .keys()
+                .chain(c.methods.keys())
+                .cloned()
+                .collect(),
+            inherits: c.extends.is_some(),
+            bases: rw.class_bases(name),
+            ..Frame::default()
+        };
+        enter(
+            &mut rw,
+            owner.unwrap_or_else(|| scope_owner(name.rsplit_once('.').map_or("", |(s, _)| s))),
+        );
+        rw.frames.push(frame);
+        for m in std::sync::Arc::make_mut(&mut c.methods).values_mut() {
+            match &mut m.kind {
+                ClassMethodKind::Function(f)
+                | ClassMethodKind::PureVirtual(f)
+                | ClassMethodKind::Extern(f) => rw.function(f),
+                ClassMethodKind::Task(t) => rw.task(t),
+            }
+        }
+        for e in c
+            .property_inits
+            .values_mut()
+            .chain(&mut c.extends_args)
+            .chain(c.property_type_args.values_mut().flatten())
+        {
+            rw.expr(e);
+        }
+        for constraint in c.constraints.values_mut() {
+            constraint.items.iter_mut().for_each(|i| rw.constraint(i));
+        }
+        rw.frames.pop();
+    }
+}
+
 /// Gather every package's type names and imports; `None` when no type name
 /// is declared by a package and anywhere else (nothing to do).
 fn collect(descs: &[Description]) -> Option<Info> {
@@ -1136,6 +1452,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
         colliding_members,
         colliding_values,
         mangled_vars,
+        split_arrays: false,
         class_colliding,
         hiding,
         repeated_module_classes,
@@ -1572,7 +1889,16 @@ impl Rw<'_> {
                     return None;
                 }
             }
-            if f.values.contains(n) || f.inherits {
+            let inherited = f.inherits
+                && (!self.info.split_arrays
+                    || f.bases.is_empty()
+                    || f.bases.iter().any(|base| {
+                        self.info
+                            .classes
+                            .get(base)
+                            .is_none_or(|ci| ci.values.contains(n))
+                    }));
+            if f.values.contains(n) || inherited {
                 return None;
             }
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
@@ -2120,7 +2446,9 @@ impl Rw<'_> {
                 // A renamed package variable (see `mangled_vars`), as
                 // `Q::v...` or bare: spell it by its storage name and keep the
                 // selects and member path.
-                if h.root.is_none() && !self.info.mangled_vars.is_empty() {
+                if (h.root.is_none() || self.info.split_arrays)
+                    && !self.info.mangled_vars.is_empty()
+                {
                     let qualified = h.path.len() >= 2
                         && h.path[0].selects.is_empty()
                         && self.info.mangled_vars.contains(&h.path[1].name.name);
@@ -2132,7 +2460,10 @@ impl Rw<'_> {
                     if let Some(m) = to {
                         h.path.remove(0);
                         h.path[0].name.name = m;
-                    } else if let Some(m) = self.mangled_var(&h.path[0].name.name) {
+                        h.root = None;
+                    } else if h.root.is_none()
+                        && let Some(m) = self.mangled_var(&h.path[0].name.name)
+                    {
                         h.path[0].name.name = m;
                     }
                 }
