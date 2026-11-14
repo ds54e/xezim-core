@@ -6159,6 +6159,7 @@ pub fn register_scoped_typedef_alias(
     elab: &mut ElaboratedModule,
 ) {
     let key = format!("{}::{}", pkg, td.name.name);
+    register_pattern_type(&key, Some(td as *const TypedefDeclaration as usize));
     if let Some(w) = elab.typedefs.get(&td.name.name).copied() {
         typedefs_insert_traced(&mut elab.typedefs, "insert:scoped_alias", key.clone(), w);
     }
@@ -6530,6 +6531,12 @@ fn check_enum_member_duplicates(
 }
 
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    if !td.forward && !matches!(td.data_type, DataType::Void(_)) {
+        register_pattern_type(
+            &td.name.name,
+            Some(td as *const TypedefDeclaration as usize),
+        );
+    }
     // A later package may reuse a bare typedef name with scalar geometry.
     // Do not carry an earlier declaration's packed element stride into it.
     if !matches!(td.data_type, DataType::Void(_)) {
@@ -9709,6 +9716,7 @@ pub fn elaborate_module_with_defs(
     // §20.6.2/§20.7: the module's declarations answer `$bits` and the array
     // queries in its constant expressions for the whole elaboration.
     DECL_SHAPES_CACHE.with(|c| c.borrow_mut().clear());
+    PATTERN_TYPE_DECLS.with(|c| c.borrow_mut().clear());
     let _decl_shapes = install_decl_shapes(module);
 
     // §24.3: a program block shall not contain module declarations —
@@ -10362,6 +10370,7 @@ pub fn elaborate_module_with_defs(
                         a.name.name.clone(),
                         w,
                     );
+                    register_pattern_type(&a.name.name, None);
                     elab.typedef_types.insert(a.name.name.clone(), dt.clone());
                     // §6.24.1: a cast to the type parameter in a constant
                     // expression (`T'(45)`) reads its declared type from the
@@ -10742,6 +10751,7 @@ pub fn elaborate_module_with_defs(
         seen.insert(key.clone());
         let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
         typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", key.clone(), w);
+        register_pattern_type(&key, None);
         elab.typedef_types.insert(key.clone(), nd.data_type.clone());
         info.insert(
             key,
@@ -13505,6 +13515,7 @@ pub fn elaborate_module_with_defs(
                                 a.name.name.clone(),
                                 w,
                             );
+                            register_pattern_type(&a.name.name, None);
                             elab.typedef_types.insert(a.name.name.clone(), dt.clone());
                             // §6.24.1: a cast to the type parameter in a constant
                             // expression (`T'(45)`) reads its declared type from the
@@ -19955,6 +19966,11 @@ fn elaborate_items(
                 }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                if let ParameterKind::Type { assignments } = &pd.kind {
+                    for a in assignments {
+                        register_pattern_type(&a.name.name, None);
+                    }
+                }
                 if let ParameterKind::Data {
                     data_type,
                     assignments,
@@ -25546,6 +25562,15 @@ pub struct DeclShape {
 }
 
 thread_local! {
+    /// Registration collisions for default matching only; None means different
+    /// declarations or an ineligible parameter/nettype/instance binding wrote the name.
+    /// Addresses are identity tokens, never dereferenced: compared AST nodes must
+    /// remain alive at stable addresses until the last comparison (the borrowed
+    /// design and retained effective items own them). Clear before each elaboration;
+    /// never admit a freed/reused clone address as the same declaration. Transient
+    /// type-parameter bindings use None, so registration can only make us decline.
+    static PATTERN_TYPE_DECLS: std::cell::RefCell<HashMap<String, Option<usize>>>
+        = std::cell::RefCell::new(HashMap::default());
     /// Declared shapes of the module (or instance) whose body is being
     /// elaborated, keyed by bare name. Installed by `DeclShapesGuard` for that
     /// scope only and restored afterwards, so a name never answers from
@@ -28659,6 +28684,8 @@ fn emit_member_elem_assigns(
 struct PatternKeys {
     types: Vec<(DataType, Expression)>,
     default: Option<Expression>,
+    // One shape/chain lookup per pattern, shared by all its members/elements.
+    default_type: std::cell::OnceCell<Option<(usize, String)>>,
 }
 
 impl PatternKeys {
@@ -28704,9 +28731,9 @@ impl PatternKeys {
     /// matches wins (§10.9.2); otherwise `default:` applies. An aggregate
     /// (unpacked array or structure, packed structure, multidimensional
     /// packed array; §6.11.1) gets the keys as a pattern of its own, so they
-    /// reach its members and elements; a pattern given as the default is the
-    /// aggregate's own value. None when nothing covers it, or when a type
-    /// key cannot be matched here.
+    /// reach its members and elements; a pattern or a value of the matching
+    /// type given as the default is the aggregate's own value. None when
+    /// nothing covers it, or when a type key cannot be matched here.
     fn value_for(
         &self,
         dt: &DataType,
@@ -28740,6 +28767,34 @@ impl PatternKeys {
         {
             return Some(d.clone());
         }
+        // IEEE 1800-2023 §10.9.2: a default whose self-determined type
+        // matches the member type sets that member whole. Use the scope's
+        // declared shape and type-key signature (name/position/bounds), but
+        // require unambiguous chains ending at the same named declaration.
+        if !is_array
+            && let Some(d) = &self.default
+            && let Some((value_decl, value)) = self.default_type.get_or_init(|| {
+                let name = decl_shape_operand_name(d)?;
+                let shape = decl_shape_of(&name)?;
+                if shape.by_type_param || !shape.unpacked.is_empty()
+                    || decl_shape_query(&name, Some(params))?.0.unpacked != 0
+                {
+                    return None;
+                }
+                Some((pattern_default_declaration(&shape.data_type, typedef_types)?,
+                    pattern_type_signature(&shape.data_type, typedef_types, params)?))
+            })
+            // Unpacked structures keep their existing member-wise fallback.
+            && !matches!(resolve_typedef_chain(dt, typedef_types),
+                DataType::Struct(su) if !su.packed)
+            && !matches!(dt, DataType::TypeReference { name, .. }
+                if TYPEDEF_SHAPES_TLS.with(|c| lookup_scoped_type(name, &c.borrow().1)
+                    .is_some_and(|dims| !dims.is_empty())))
+            && pattern_default_declaration(dt, typedef_types).as_ref() == Some(value_decl)
+            && pattern_type_signature(dt, typedef_types, params).as_ref() == Some(value)
+        {
+            return Some(d.clone());
+        }
         if self.types.is_empty() && self.default.is_none() {
             return None;
         }
@@ -28753,6 +28808,53 @@ impl PatternKeys {
         }
         Some(Expression::new(ExprKind::AssignmentPattern(items), span))
     }
+}
+
+/// §6.22.1(d): repeated registration is safe for default matching only
+/// for the same AST declaration. Keep package aliases on that same record;
+/// source offsets alone cannot distinguish declarations in separate files.
+/// §6.22.1(b): type parameters and nettypes may hide a typedef too. None
+/// declines their chains even without a collision; bindings can be transient.
+fn register_pattern_type(name: &str, declaration: Option<usize>) {
+    PATTERN_TYPE_DECLS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.entry(name.to_string())
+            .and_modify(|old| {
+                if *old != declaration {
+                    *old = None;
+                }
+            })
+            .or_insert(declaration);
+    });
+}
+
+/// §6.22.1(d): decline a chain containing a registration collision. For
+/// structs/enums also require the final registered declaration: different
+/// packages can have identical offsets. This guards defaults only; it does
+/// not change the existing type-key comparison or resolve hidden names.
+fn pattern_default_declaration(dt: &DataType, types: &HashMap<String, DataType>) -> Option<usize> {
+    PATTERN_TYPE_DECLS.with(|c| {
+        let declarations = c.borrow();
+        let mut cur = dt;
+        let mut last = None;
+        for _ in 0..64 {
+            match cur {
+                DataType::TypeReference { name, .. } => {
+                    // A qualified type must not borrow a bare alias's identity.
+                    let declaration = if name.scopes.is_empty() {
+                        declarations.get(&name.name.name)
+                    } else {
+                        declarations.get(&name.qualified())
+                    };
+                    last = Some(declaration.copied()??);
+                    cur = lookup_scoped_type(name, types)?;
+                }
+                DataType::Struct(_) | DataType::Enum(_) => return last,
+                _ => return Some(0),
+            }
+        }
+        None
+    })
 }
 
 /// Whether type and `default:` keys reach into a value of type `dt` rather
@@ -40112,6 +40214,7 @@ fn inline_module_items(
                     // The override's dimensions are the parent's expressions.
                     saved_type_shapes.push((tp_name.clone(), tls_typedef_shape(tp_name)));
                     tls_register_type_param_shape(tp_name, tp_dt, &resolved_dt, scoped_eval_params);
+                    register_pattern_type(&tp_name, None);
                     elab.typedef_types.insert(tp_name.clone(), resolved_dt);
                 }
 
@@ -40629,6 +40732,7 @@ fn inline_module_items(
                                         },
                                     );
                                     elab.typedefs.insert_if_changed(a.name.name.clone(), w);
+                                    register_pattern_type(&a.name.name, None);
                                     elab.typedef_types.insert(a.name.name.clone(), resolved_dt);
                                 }
                             }
@@ -41629,6 +41733,7 @@ fn inline_module_items(
                                 a.name.name.clone(),
                                 w,
                             );
+                            register_pattern_type(&a.name.name, None);
                             elab.typedef_types.insert(a.name.name.clone(), resolved_dt);
                         }
                     }
@@ -42081,6 +42186,7 @@ fn inline_module_items(
                                 td.name.name.clone(),
                                 base_width,
                             );
+                            register_pattern_type(&td.name.name, None);
                             elab.typedef_types
                                 .insert(td.name.name.clone(), td.data_type.clone());
                             // §6.18/§23.10: the INSTANCE-scoped key. The bare
@@ -42182,6 +42288,7 @@ fn inline_module_items(
                             // for the duration of its inlining (see the rail
                             // comment above); first-declared still wins the
                             // post-inlining fallback via the restore.
+                            register_pattern_type(&td.name.name, None);
                             elab.typedef_types
                                 .insert(td.name.name.clone(), td.data_type.clone());
                             elab.typedef_types
