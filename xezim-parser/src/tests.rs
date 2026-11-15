@@ -1220,3 +1220,52 @@ fn ansi_port_inherits_only_when_it_omits_direction_kind_and_type() {
     assert_eq!(p[1].direction, Some(PortDirection::Input));
     assert!(p[1].net_type.is_none());
 }
+
+/// §6.6.7 Syntax 6-1 permits package_scope or class_scope after `with`.
+#[test]
+fn nettype_resolution_function_keeps_its_scope() {
+    let declarations = r#"
+function automatic real res(input real d[]); return 0.0; endfunction
+class C;
+  static function real res(input real d[]); return 0.0; endfunction
+endclass
+package p;
+  function automatic real res(input real d[]); return 0.0; endfunction
+  class C;
+    static function real res(input real d[]); return 0.0; endfunction
+  endclass
+endpackage
+"#;
+    for name in ["res", "p::res", "C::res", "p::C::res"] {
+        let result = parse(&format!("{declarations} nettype real N with {name};"));
+        assert!(result.errors.is_empty(), "{name}: {:?}", result.errors);
+        let Description::PackageItem(crate::ast::decl::PackageItem::Nettype(nd)) =
+            result.source.descriptions.last().unwrap()
+        else {
+            panic!("expected nettype declaration");
+        };
+        assert_eq!(nd.resolver.as_ref().unwrap().qualified(), name);
+    }
+}
+
+/// §5.6.1 / §6.6.7: only punctuation tokens introduce resolver scopes.
+#[test]
+fn escaped_nettype_resolver_is_not_a_scoped_name() {
+    for (name, scopes, leaf) in [
+        (r"\C::res ", 0, "C::res"),
+        ("C::res", 1, "res"),
+        (r"p::\C::res ", 1, "C::res"),
+        (r"\p::C ::res", 1, "res"),
+    ] {
+        let result = parse(&format!("nettype real N with {name};"));
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let Description::PackageItem(crate::ast::decl::PackageItem::Nettype(nd)) =
+            &result.source.descriptions[0]
+        else {
+            panic!("expected nettype");
+        };
+        let resolver = nd.resolver.as_ref().unwrap();
+        assert_eq!(resolver.scopes.len(), scopes);
+        assert_eq!(resolver.name.name, leaf);
+    }
+}
