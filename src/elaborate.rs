@@ -3877,6 +3877,9 @@ pub struct ElaboratedModule {
     /// written, so a loaded artifact has the folds already applied.
     #[serde(skip)]
     pub nettype_resolvers: HashMap<String, String>,
+    /// §6.6.7 / §5.6.1: scope syntax retained until resolver lookup/emission.
+    #[serde(skip)]
+    pub nettype_resolver_names: HashMap<String, TypeName>,
     /// Array declarations: base_name -> (lo_index, hi_index, element_width)
     pub arrays: HashMap<String, (i64, i64, u32)>,
     /// Associative arrays: name -> true if string-keyed
@@ -4612,6 +4615,7 @@ impl ElaboratedModule {
             typedefs: TypedefTable::default(),
             typedef_types: SharedMap::default(),
             nettype_resolvers: HashMap::default(),
+            nettype_resolver_names: HashMap::default(),
             arrays: HashMap::default(),
             associative_arrays: HashMap::default(),
             assoc_elem_widths: HashMap::default(),
@@ -10946,9 +10950,25 @@ pub fn elaborate_module_with_defs(
     // field layout, member access) see THROUGH a nettype name to the type it
     // wraps — without it a `nettype real rn;` net lost `is_real` and read back
     // as the raw f64 bit pattern.
-    let mut nettype_info: HashMap<String, (DataType, Option<String>)> = HashMap::default();
+    let mut nettype_info: HashMap<String, (DataType, Option<TypeName>)> = HashMap::default();
+    // §26.3: index package-local class heads once; class table package aliases
+    // are installed later, during inlining. Already-qualified heads stay intact.
+    let package_classes: HashSet<String> = all_defs
+        .into_iter()
+        .flat_map(|defs| defs.values())
+        .filter_map(|d| match d {
+            Definition::Package(p) => Some(p),
+            _ => None,
+        })
+        .flat_map(|p| {
+            p.items.iter().filter_map(move |i| match i {
+                PackageItem::Class(c) => Some(nested_scope_name(&p.name.name, &c.name.name)),
+                _ => None,
+            })
+        })
+        .collect();
     let register_nettype = |elab: &mut ElaboratedModule,
-                            info: &mut HashMap<String, (DataType, Option<String>)>,
+                            info: &mut HashMap<String, (DataType, Option<TypeName>)>,
                             seen: &mut HashSet<String>,
                             nd: &crate::ast::decl::NettypeDeclaration,
                             key: String,
@@ -10964,17 +10984,29 @@ pub fn elaborate_module_with_defs(
                 // §26.3: an import exposes the original declaration; its
                 // resolver stays in the declaring package, even if the
                 // importing module has a function with the same name.
-                nd.resolver.as_ref().map(|r| match package {
-                    Some(pkg) => {
-                        let qualified = format!("{}::{}", pkg, r.name);
-                        if elab.functions.contains_key(&qualified) {
-                            qualified
-                        } else {
-                            // Keep imported resolvers on the existing lookup path.
-                            r.name.clone()
+                nd.resolver.as_ref().map(|r| {
+                    let mut r = r.clone();
+                    if let Some(pkg) = package {
+                        let qualified = format!("{pkg}::{}", r.qualified());
+                        if !r.has_scope() && elab.functions.contains_key(&qualified) {
+                            // Qualification of a plain function is not class-scope syntax.
+                            r.name.name = qualified;
+                        } else if r.scopes.first().is_some_and(|head| {
+                            package_classes.contains(&format!("{pkg}::{}", head.name.name))
+                        }) {
+                            r.scopes.insert(
+                                0,
+                                TypeScope {
+                                    name: Identifier {
+                                        name: pkg.to_string(),
+                                        span: r.span,
+                                    },
+                                    type_args: Vec::new(),
+                                },
+                            );
                         }
                     }
-                    None => r.name.clone(),
+                    r
                 }),
             ),
         );
@@ -11088,7 +11120,8 @@ pub fn elaborate_module_with_defs(
     // formal on the other side of the port read the default.
     for (nt, (_, resolver)) in &nettype_info {
         if let Some(r) = resolver {
-            elab.nettype_resolvers.insert(nt.clone(), r.clone());
+            elab.nettype_resolvers.insert(nt.clone(), r.qualified());
+            elab.nettype_resolver_names.insert(nt.clone(), r.clone());
         } else {
             // Declared without a resolution function: recorded with an empty
             // name so the post-inline pass can still enforce the one-driver
@@ -23184,13 +23217,36 @@ pub fn is_type_signed(dt: &DataType) -> bool {
 }
 
 /// Look up a §6.6.7 nettype resolution function — by bare name, or as a package
-/// member hoisted under a `pkg::name` key.
+/// member hoisted under a `pkg::name` key, or a class method. The optional
+/// flag records whether a class method is static (§6.6.7).
 fn lookup_resolver<'a>(
     elab: &'a ElaboratedModule,
+    nettype: &str,
     name: &str,
-) -> Option<&'a crate::ast::decl::FunctionDeclaration> {
+) -> Option<(&'a crate::ast::decl::FunctionDeclaration, Option<bool>)> {
+    let syntax = elab.nettype_resolver_names.get(nettype);
+    // §23.7.1: a visible class prefix wins over a same-named package.
+    if let Some(r) = syntax.filter(|r| r.has_scope())
+        && elab.classes.contains_key(&r.scope_prefix())
+    {
+        let scope = r.scope_prefix();
+        let method = &r.name.name;
+        // §26.3: keep the exact class scope when package class names collide.
+        let owner = member_declaring_class(elab, &scope, method)?;
+        let cd = elab.classes.get(&owner)?;
+        let m = cd.methods.get(method)?;
+        return match &m.kind {
+            crate::ast::decl::ClassMethodKind::Function(fd) => {
+                Some((fd, Some(cd.static_methods.contains(method))))
+            }
+            _ => None,
+        };
+    }
     if let Some(fd) = elab.functions.get(name) {
-        return Some(fd);
+        return Some((fd, None));
+    }
+    if syntax.is_some_and(TypeName::has_scope) {
+        return None;
     }
     let suffix = format!("::{}", name);
     let mut keys: Vec<&String> = elab
@@ -23199,7 +23255,9 @@ fn lookup_resolver<'a>(
         .filter(|k| k.ends_with(&suffix))
         .collect();
     keys.sort();
-    keys.first().and_then(|k| elab.functions.get(*k))
+    keys.first()
+        .and_then(|k| elab.functions.get(*k))
+        .map(|fd| (fd, None))
 }
 
 /// §6.6.7 constraints on a nettype resolution function, checked at elaboration
@@ -23210,20 +23268,30 @@ fn validate_resolver(elab: &ElaboratedModule, nettype: &str, name: &str) -> Resu
     // out-of-scope resolver would silently drive the net to 0, and
     // single-driver nets (routed through the resolver too) would regress from
     // always-correct to silently wrong.
-    let Some(fd) = lookup_resolver(elab, name) else {
+    let Some((fd, class_static)) = lookup_resolver(elab, nettype, name) else {
         return Err(format!(
             "nettype '{}' names resolution function '{}', which is not declared \
-             (IEEE 1800-2017 6.6.7). Note a package-qualified resolver \
-             (`nettype T w with pkg::f;`) is not yet representable.",
+             (IEEE 1800-2023 6.6.7).",
             nettype, name
         ));
     };
+
+    // §6.6.7: class resolution functions shall be class static methods.
+    if class_static == Some(false) {
+        return Err(format!(
+            "nettype '{}' resolution function '{}' must be a class static method (IEEE 1800-2023 6.6.7)",
+            nettype, name
+        ));
+    }
 
     // §6.6.7: "the resolution function shall be an automatic function". A
     // static one leaks the previous call's locals and return value between
     // resolutions of different nets, which surfaces as a stale value rather
     // than an error.
-    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic) {
+    // §8.6: class methods have automatic lifetime by default.
+    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
+        && (class_static.is_none() || fd.lifetime.is_some())
+    {
         return Err(format!(
             "nettype '{}' resolution function '{}' must be declared `automatic` \
              (IEEE 1800-2017 6.6.7)",
@@ -23257,6 +23325,15 @@ fn validate_resolver(elab: &ElaboratedModule, nettype: &str, name: &str) -> Resu
                  an unpacked array of the nettype data type, e.g. `input T {} []` \
                  (IEEE 1800-2017 6.6.7)",
                 nettype, name, port.name.name, port.name.name
+            ));
+        }
+        // §6.6.7: the outer array of a class resolver's formal is dynamic.
+        if class_static.is_some()
+            && !matches!(port.dimensions.first(), Some(UnpackedDimension::Unsized(_)))
+        {
+            return Err(format!(
+                "nettype '{}' class resolution function '{}' must take a dynamic array (IEEE 1800-2023 6.6.7)",
+                nettype, name
             ));
         }
         if !matches!(port.direction, PortDirection::Input) {
@@ -50161,6 +50238,17 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         return Ok(());
     }
 
+    // §6.6.7: class resolvers must be static even on unused declarations.
+    for (nettype, resolver) in &elab.nettype_resolvers {
+        if elab
+            .nettype_resolver_names
+            .get(nettype)
+            .is_some_and(TypeName::has_scope)
+        {
+            validate_resolver(elab, nettype, resolver)?;
+        }
+    }
+
     // A nettype net that is an UNPACKED ARRAY resolves per element (§6.6.7,
     // §6.6.8): `interconnect realN a[1]; source s(a[0]); load l(a[0]);` — a
     // port connection drives the ELEMENT `a[0]`, an Index expression whose
@@ -50629,9 +50717,71 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     crate::ast::expr::AssignmentPatternItem::Ordered(d)
                 })
                 .collect();
+            // §6.6.7: use the ordinary scoped-call AST for class methods;
+            // free and package functions retain their existing call shape.
+            let mut func = make_ident_expr(&resolver);
+            if lookup_resolver(elab, &nt_name, &resolver).is_some_and(|(_, c)| c.is_some()) {
+                let syntax = &elab.nettype_resolver_names[&nt_name];
+                let scope = syntax.scope_prefix();
+                let name = &syntax.name.name;
+                // §6.6.7 permits aggregate resolvers, but class-call projection
+                // and named-return member writes need shared runtime support.
+                // Reject aggregates rather than newly admitting wrong values.
+                let (fd, _) =
+                    lookup_resolver(elab, &nt_name, &resolver).expect("validated resolver");
+                // §7.4.1, §6.18: packed dimensions on typedef references
+                // add to the base type's dimensions. Do not discard them via
+                // resolve_typedef_chain, or a typedef can bypass this guard.
+                // One step per registered type also bounds malformed cycles
+                // without cutting off a longer, valid typedef chain.
+                let mut return_type = &fd.return_type;
+                let mut packed_dimensions = 0;
+                for _ in 0..=elab.typedef_types.len() {
+                    match return_type {
+                        DataType::TypeReference {
+                            name, dimensions, ..
+                        } => {
+                            packed_dimensions += dimensions.len();
+                            let Some(next) = lookup_scoped_type(name, &elab.typedef_types) else {
+                                break;
+                            };
+                            return_type = next;
+                        }
+                        DataType::IntegerVector { dimensions, .. }
+                        | DataType::Implicit { dimensions, .. } => {
+                            packed_dimensions += dimensions.len();
+                            break;
+                        }
+                        DataType::Enum(e) => {
+                            packed_dimensions += e.dimensions.len();
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                if members.is_some()
+                    || matches!(
+                        resolve_typedef_chain(&fd.return_type, &elab.typedef_types),
+                        DataType::Struct(_)
+                    )
+                    || packed_dimensions > 1
+                {
+                    return Err(format!(
+                        "nettype '{}' class resolution function '{}' returning a struct or multidimensional packed array is not supported",
+                        nt_name, resolver
+                    ));
+                }
+                func = member_ref_expr(
+                    &make_ident_expr(&scope),
+                    &Identifier {
+                        name: name.to_string(),
+                        span,
+                    },
+                );
+            }
             Expression::new(
                 ExprKind::Call {
-                    func: Box::new(make_ident_expr(&resolver)),
+                    func: Box::new(func),
                     args: vec![Expression::new(ExprKind::AssignmentPattern(items), span)],
                 },
                 span,

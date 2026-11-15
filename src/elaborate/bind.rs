@@ -979,7 +979,7 @@ impl<'a> Binder<'a> {
             ModuleItem::NettypeDeclaration(n) => self.with_pos("nettype", |b| {
                 b.data_type(&mut n.data_type);
                 if let Some(r) = &n.resolver {
-                    b.ident(r);
+                    b.ident(&r.name);
                 }
             }),
             ModuleItem::SpecifyBlock(s) => self.with_pos("specify", |b| b.specify(s)),

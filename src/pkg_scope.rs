@@ -890,6 +890,11 @@ fn collect(descs: &[Description]) -> Option<Info> {
     let mut other: HashSet<String> = HashSet::default();
     let mut other_members: HashSet<String> = HashSet::default();
     let mut other_values: HashSet<String> = HashSet::default();
+    let mut scoped_nettypes = false;
+    let scoped_items = |items: &[ModuleItem]| {
+        items.iter().any(|item| matches!(item, ModuleItem::NettypeDeclaration(n)
+            if n.resolver.as_ref().is_some_and(TypeName::has_scope)))
+    };
     for d in descs {
         match d {
             Description::Package(p) => {
@@ -911,6 +916,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                         // §6.6.7 / §26.3: nettypes retain their package identity
                         // under the same import rules as other named types.
                         PackageItem::Nettype(n) => {
+                            scoped_nettypes |= n.resolver.as_ref().is_some_and(TypeName::has_scope);
                             pi.types.insert(n.name.name.clone());
                         }
                         PackageItem::Class(c) => {
@@ -950,6 +956,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 other.insert(c.name.name.clone());
             }
             Description::PackageItem(PackageItem::Nettype(n)) => {
+                scoped_nettypes |= n.resolver.as_ref().is_some_and(TypeName::has_scope);
                 other.insert(n.name.name.clone());
             }
             Description::PackageItem(PackageItem::Covergroup(cg)) => {
@@ -963,6 +970,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 });
             }
             Description::Module(m) => {
+                scoped_nettypes |= scoped_items(&m.items);
                 for pd in &m.params {
                     param_names(pd, &mut HashSet::default(), &mut other_values);
                 }
@@ -970,6 +978,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 module_dpi_names(&m.items, &mut other_values);
             }
             Description::Interface(m) => {
+                scoped_nettypes |= scoped_items(&m.items);
                 for pd in &m.params {
                     param_names(pd, &mut HashSet::default(), &mut other_values);
                 }
@@ -977,6 +986,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 module_dpi_names(&m.items, &mut other_values);
             }
             Description::Program(m) => {
+                scoped_nettypes |= scoped_items(&m.items);
                 for pd in &m.params {
                     param_names(pd, &mut HashSet::default(), &mut other_values);
                 }
@@ -999,7 +1009,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
             .map(|(n, _)| n.to_string())
             .collect::<HashSet<String>>()
     };
-    let colliding = clash(|pi| &pi.types, &other);
+    let mut colliding = clash(|pi| &pi.types, &other);
     let colliding_members = clash(|pi| &pi.members, &other_members);
     let colliding_values = clash(|pi| &pi.values, &other_values);
     // A name some `import Q::n;` / `export Q::n;` spells out keeps its
@@ -1052,6 +1062,14 @@ fn collect(descs: &[Description]) -> Option<Info> {
     // §8.3: a class is a scope of its own; a type name a class declares
     // collides when it is declared anywhere else as well.
     let all_classes = design_classes(descs);
+    // §23.7.1: keep class prefixes distinct from same-named packages;
+    // only lexical/import visibility may select the class's qualified key.
+    colliding.extend(all_classes.iter().filter_map(|(scope, c)| {
+        (scoped_nettypes
+            && matches!(scope, ClassScope::Package(_))
+            && pkgs.contains_key(&c.name.name))
+            .then(|| c.name.name.clone())
+    }));
     let mut lexical_counts: HashMap<&str, usize> = HashMap::default();
     for (scope, c) in &all_classes {
         if !matches!(scope, ClassScope::Package(_)) {
@@ -1062,9 +1080,10 @@ fn collect(descs: &[Description]) -> Option<Info> {
         .iter()
         .filter(|(s, c)| {
             matches!(s, ClassScope::Module(_))
-                && lexical_counts
-                    .get(c.name.name.as_str())
-                    .is_some_and(|count| *count > 1)
+                && ((scoped_nettypes && pkgs.contains_key(&c.name.name))
+                    || lexical_counts
+                        .get(c.name.name.as_str())
+                        .is_some_and(|count| *count > 1))
         })
         .map(|(_, c)| c.name.name.clone())
         .collect();
@@ -3214,7 +3233,7 @@ impl Rw<'_> {
                 self.frames.pop();
             }
             ModuleItem::LetDeclaration(l) => self.expr(&mut l.expr),
-            ModuleItem::NettypeDeclaration(n) => self.dtype(&mut n.data_type),
+            ModuleItem::NettypeDeclaration(n) => self.nettype(n),
             ModuleItem::DPIImport(d) => self.dpi(&mut d.proto),
             ModuleItem::DPIExport(d) => self.dpi(&mut d.proto),
             ModuleItem::OutOfClassConstraint {
@@ -3265,6 +3284,18 @@ impl Rw<'_> {
                     .module_classes
                     .insert(c.name.name.clone(), self.info.module_class_name(owner, c));
             }
+        }
+    }
+
+    fn nettype(&mut self, n: &mut NettypeDeclaration) {
+        self.dtype(&mut n.data_type);
+        // §23.7.1 / §26.3: bind a resolver's class prefix in the declaration
+        // scope, just as an ordinary scoped call, before module flattening.
+        if let Some(r) = &mut n.resolver
+            && let Some(head) = r.scopes.first_mut()
+        {
+            // §5.6.1: an escaped identifier containing `::` has no scope link.
+            self.type_ident(&mut head.name);
         }
     }
 
@@ -3341,7 +3372,7 @@ impl Rw<'_> {
                 if let Some(m) = renamed(&n.name.name) {
                     n.name.name = m;
                 }
-                self.dtype(&mut n.data_type);
+                self.nettype(n);
             }
             PackageItem::Property(p) => {
                 p.items.iter_mut().for_each(|s| self.stmt(s));

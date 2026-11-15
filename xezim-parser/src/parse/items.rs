@@ -3066,7 +3066,22 @@ impl Parser {
                 let data_type = self.parse_data_type();
                 let name = self.parse_identifier();
                 let resolver = if self.eat(TokenKind::KwWith).is_some() {
-                    Some(self.parse_identifier())
+                    // §6.6.7, Syntax 6-1 permits a package or class scope.
+                    let mut name = self.parse_identifier();
+                    let mut scopes = Vec::new();
+                    while self.eat(TokenKind::DoubleColon).is_some() {
+                        scopes.push(TypeScope {
+                            name,
+                            type_args: Vec::new(),
+                        });
+                        name = self.parse_identifier();
+                    }
+                    Some(TypeName {
+                        scopes,
+                        name,
+                        span: self.span_from(start),
+                        bound: Default::default(),
+                    })
                 } else {
                     None
                 };

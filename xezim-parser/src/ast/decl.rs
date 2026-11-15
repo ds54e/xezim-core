@@ -457,7 +457,8 @@ fn let_subst(e: &mut Expression, map: &std::collections::HashMap<String, Express
 pub struct NettypeDeclaration {
     pub data_type: DataType,
     pub name: Identifier,
-    pub resolver: Option<Identifier>,
+    /// §6.6.7: retain scope separators separately from escaped identifier text.
+    pub resolver: Option<TypeName>,
     pub span: Span,
 }
 
