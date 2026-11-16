@@ -11101,6 +11101,19 @@ pub fn elaborate_module_with_defs(
     // `extends` when their constraints are validated.
     let local_defs = defs_with_local_classes(module.items(), all_defs);
     let cls_defs = local_defs.as_ref().or(all_defs);
+    // New array defaults use only this module's typedefs: imported and
+    // $unit types need their declaring scope for member expressions (§26.3).
+    // The scalar path retains its existing type environment.
+    let member_default_types: HashMap<String, DataType> = module
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::TypedefDeclaration(td) => {
+                Some((td.name.name.clone(), td.data_type.clone()))
+            }
+            _ => None,
+        })
+        .collect();
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -12417,6 +12430,101 @@ pub fn elaborate_module_with_defs(
                             continue;
                         }
                     }
+                    // §7.2.2 / §7.4.2: declared member defaults initialize
+                    // each fixed-array element just as they initialize a scalar.
+                    // Keep this pass before the dimension-specific branches;
+                    // an explicit variable initializer suppresses these defaults.
+                    if decl.init.is_none() {
+                        let types = if effective_dims.is_empty() {
+                            &elab.typedef_types
+                        } else {
+                            &member_default_types
+                        };
+                        // §6.18: retain the scalar path's first lookup before
+                        // the typedef-chain walk (including its existing limit).
+                        let dt = match &dd.data_type {
+                            DataType::TypeReference { name, .. } if effective_dims.is_empty() => {
+                                lookup_scoped_type(name, types)
+                                    .or_else(|| types.get(&name.name.name))
+                                    .unwrap_or(&dd.data_type)
+                            }
+                            _ => &dd.data_type,
+                        };
+                        let resolved = resolve_typedef_chain(dt, types);
+                        if let DataType::Struct(su) = resolved
+                            && !su.packed
+                            && matches!(su.kind, StructUnionKind::Struct)
+                            && su
+                                .members
+                                .iter()
+                                .any(|m| m.declarators.iter().any(|d| d.init.is_some()))
+                        {
+                            let su = su.clone();
+                            let shape: Option<Vec<_>> = effective_dims
+                                .iter()
+                                .map(|d| match d {
+                                    UnpackedDimension::Range { .. }
+                                    | UnpackedDimension::Expression { .. } => extract_array_range(
+                                        std::slice::from_ref(d),
+                                        &elab.parameters,
+                                    ),
+                                    _ => None,
+                                })
+                                .collect();
+                            if let Some(shape) = shape.filter(|s| {
+                                s.iter()
+                                    .try_fold(1i64, |n, &(lo, hi)| {
+                                        n.checked_mul(hi.checked_sub(lo)?.checked_add(1)?)
+                                    })
+                                    .is_some_and(|n| n > 0)
+                            }) {
+                                let mut stmts = Vec::new();
+                                for indices in shape_index_tuples(&shape) {
+                                    let suffix: String =
+                                        indices.iter().map(|i| format!("[{i}]")).collect();
+                                    let base = format!("{}{}", decl.name.name, suffix);
+                                    if !shape.is_empty() {
+                                        register_unpacked_aggregate(
+                                            &mut elab,
+                                            &base,
+                                            &dd.data_type,
+                                        );
+                                    }
+                                    for member in &su.members {
+                                        for mdecl in &member.declarators {
+                                            if let Some(init) = &mdecl.init {
+                                                stmts.push(Statement::new(
+                                                    StatementKind::BlockingAssign {
+                                                        lvalue: Expression::new(
+                                                            ExprKind::MemberAccess {
+                                                                expr: Box::new(
+                                                                    make_multi_index_expr(
+                                                                        &decl.name.name,
+                                                                        &indices,
+                                                                    ),
+                                                                ),
+                                                                member: mdecl.name.clone(),
+                                                            },
+                                                            Span::dummy(),
+                                                        ),
+                                                        rvalue: init.clone(),
+                                                    },
+                                                    Span::dummy(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(
+                                        StatementKind::SeqBlock { name: None, stmts },
+                                        Span::dummy(),
+                                    ),
+                                    scope: String::new(),
+                                });
+                            }
+                        }
+                    }
                     // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
                     if effective_dims.len() == 2 {
                         // Both `[0:1][0:2]` (range) and `[2][3]` (size) spell the
@@ -12918,7 +13026,7 @@ pub fn elaborate_module_with_defs(
                                 scope: String::new(),
                             });
                         }
-                        // Unpacked-struct member default initializers:
+                        // Unpacked-struct member layouts:
                         //   struct { bit [3:0] lo = c; ... } p1;
                         // Packed structs forbid member defaults (IEEE 7.2.2).
                         // Owned so later `&mut elab` calls (member pre-registration)
@@ -13482,38 +13590,6 @@ pub fn elaborate_module_with_defs(
                                     &decl.name.name,
                                     &dd.data_type,
                                 );
-                                let mut stmts: Vec<Statement> = Vec::new();
-                                for member in &su.members {
-                                    for mdecl in &member.declarators {
-                                        if let Some(init) = &mdecl.init {
-                                            let lval = Expression::new(
-                                                ExprKind::MemberAccess {
-                                                    expr: Box::new(make_ident_expr(
-                                                        &decl.name.name,
-                                                    )),
-                                                    member: mdecl.name.clone(),
-                                                },
-                                                Span::dummy(),
-                                            );
-                                            stmts.push(Statement::new(
-                                                StatementKind::BlockingAssign {
-                                                    lvalue: lval,
-                                                    rvalue: init.clone(),
-                                                },
-                                                Span::dummy(),
-                                            ));
-                                        }
-                                    }
-                                }
-                                if !stmts.is_empty() {
-                                    elab.initial_blocks.push(InitialBlock {
-                                        stmt: Statement::new(
-                                            StatementKind::SeqBlock { name: None, stmts },
-                                            Span::dummy(),
-                                        ),
-                                        scope: String::new(),
-                                    });
-                                }
                             }
                         }
                     }
