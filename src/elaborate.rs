@@ -511,6 +511,8 @@ pub struct ContinuousAssignment {
     /// them: an actual like `.d(d ^ 1)` whose operand shares the FORMAL's
     /// name otherwise resolved to the child's own port net (`u1.d = u1.d
     /// ^ 1`, a self-loop that read x forever).
+    /// Also true for synthesized clocking-input assigns whose operands already
+    /// name flattened signals and must not acquire a child scope hint.
     pub rhs_parent_scoped: bool,
     /// A continuous assignment the source spells out (an `assign`, or a net
     /// declaration assignment): the span of that statement and the instance
@@ -34885,7 +34887,167 @@ pub fn inline_instantiations(
     PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
     elab.elided_port_hashes.sort_unstable();
     elab.elided_port_hashes.dedup();
+    if result.is_ok() {
+        lower_clocking_input_expressions(elab);
+    }
     result
+}
+
+/// §14.3, §14.5, §14.13: sample expression inputs through ordinary signals,
+/// so the existing clocking sampler also applies #1step and explicit skews.
+fn lower_clocking_input_expressions(elab: &mut ElaboratedModule) {
+    use ExprKind as E;
+    use NumberLiteral as N;
+    use UnaryOp::*;
+    if elab.clocking_blocks.is_empty() {
+        return;
+    }
+    let mut blocks = std::mem::take(&mut elab.clocking_blocks);
+    for (cb, cd) in &mut blocks {
+        let mut next_stage = 0usize;
+        for s in &mut cd.signals {
+            // §14.3: input edge skews need sampling that the existing
+            // sampler does not implement; retain their original binding.
+            let Some(expr) = s
+                .bound_to
+                .as_ref()
+                .filter(|_| s.direction == PortDirection::Input && s.skew_edge.is_none())
+            else {
+                continue;
+            };
+            // Keep existing bindings and results that can retain a full
+            // aggregate/array type; these numeric results need width/sign only.
+            let mut root = expr;
+            while let E::Paren(inner) = &root.kind {
+                root = inner;
+            }
+            if !matches!(
+                root.kind,
+                E::Binary { .. } | E::Concatenation(_) | E::Replication { .. } | E::Number(_)
+            ) {
+                continue;
+            }
+            // Reuse §11.8.2 typing only when every integral operand has a
+            // known type here; calls, aggregates and unresolved names stay put.
+            let mut operands = HashMap::default();
+            let mut typed = true;
+            for_each_sub_expr(expr, &mut |e| {
+                if !typed {
+                    return;
+                }
+                typed &= match &e.kind {
+                    E::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty() =>
+                    {
+                        let name = &h.path[0].name.name;
+                        if let Some(s) = elab
+                            .signals
+                            .get(name)
+                            .filter(|s| !s.is_real && s.type_name.is_none())
+                            && matches!(
+                                elab.var_decl_types.get(name),
+                                Some(
+                                    DataType::IntegerAtom { .. }
+                                        | DataType::IntegerVector { .. }
+                                        | DataType::Implicit { .. }
+                                )
+                            )
+                            && !elab.interconnect_nets.contains(name)
+                            && !is_unpacked_array_name(elab, name)
+                            && !elab.associative_arrays.contains_key(name)
+                            && !elab.dynamic_arrays.contains(name)
+                        {
+                            let mut value = Value::new(s.width);
+                            value.is_signed = s.is_signed;
+                            operands.insert(name.clone(), value);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    E::Number(N::Integer { size: Some(_), .. } | N::UnbasedUnsized(_)) => true,
+                    // Wider unsized literals have a separate runtime sizing path.
+                    E::Number(N::Integer { base, value, .. }) => {
+                        matches!(base, NumberBase::Decimal)
+                            && value.replace('_', "").parse::<i32>().is_ok()
+                    }
+                    E::Unary { op, .. } => {
+                        !matches!(op, PreIncr | PreDecr | PostIncr | PostDecr)
+                            && !matches!(op, HashHash | SEventually | SAlways)
+                    }
+                    E::Replication { .. }
+                    | E::Binary { .. }
+                    | E::Conditional { .. }
+                    | E::Concatenation(_)
+                    | E::Paren(_) => true,
+                    _ => false,
+                };
+            });
+            if !typed {
+                continue;
+            }
+            let ty = const_context::infer(expr, &operands, &mut const_context::Types::default());
+            if !ty.integral || ty.width == 0 || ty.width > SANE_MAX_PACKED_WIDTH {
+                continue;
+            }
+            // Reuse private driver-stage names, with an unused base so a
+            // later delayed-driver pass cannot claim this stage's name.
+            let name = loop {
+                let base = format!("{cb}$input{next_stage}");
+                let name = format!("{base}$drv0");
+                next_stage += 1;
+                if !elab.signals.contains_key(&base)
+                    && !elab.var_decl_types.contains_key(&base)
+                    && !elab.signals.contains_key(&name)
+                    && !elab.decl_sites.contains_key(&name)
+                    && !elab.var_decl_types.contains_key(&name)
+                    && !elab.port_aliases.contains_key(&name)
+                    && !elab.net_port_merges.contains_key(&name)
+                    && !elab.parameters.contains_key(&name)
+                    && !elab.functions.contains_key(&name)
+                    && !elab.dpi_imports.contains_key(&name)
+                    && !elab.enum_members.contains_key(&name)
+                    && !elab.typedef_types.contains_key(&name)
+                    && !elab.classes.contains_key(&name)
+                    && !elab.clocking_signal_dirs.contains_key(&name)
+                {
+                    break name;
+                }
+            };
+            let mut value = Value::new(ty.width);
+            value.is_signed = ty.signed;
+            elab.signals.insert(
+                name.clone(),
+                Signal {
+                    name: name.clone().into(),
+                    width: ty.width,
+                    is_signed: ty.signed,
+                    is_real: false,
+                    is_const: false,
+                    direction: None,
+                    value,
+                    type_name: None,
+                },
+            );
+            elab.nets.insert(name.clone());
+            elab.continuous_assigns.push(ContinuousAssignment {
+                lhs: make_ident_expr(&name),
+                rhs: expr.clone(),
+                delay: 0,
+                delay_fall: None,
+                delay_off: None,
+                gate_delay_fall: None,
+                delay_select: None,
+                // Every admitted operand already names a flattened signal.
+                rhs_parent_scoped: true,
+                origin: None,
+            });
+            s.bound_to = Some(make_ident_expr(&name));
+        }
+    }
+    elab.clocking_blocks = blocks;
 }
 
 fn inline_instantiations_inner(

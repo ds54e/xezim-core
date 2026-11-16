@@ -2641,6 +2641,7 @@ impl Parser {
                 let mut signals: Vec<ClockingSignal> = Vec::new();
                 let mut default_input_skew: Option<crate::ast::expr::Expression> = None;
                 let mut default_output_skew: Option<crate::ast::expr::Expression> = None;
+                let mut default_input_edge: Option<crate::ast::stmt::Edge> = None;
                 let mut default_output_edge: Option<crate::ast::stmt::Edge> = None;
                 while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
                     // `default input #d output #d;` (§14.4) — capture the skew
@@ -2657,7 +2658,9 @@ impl Parser {
                             self.bump();
                             // `clocking_skew ::= edge_identifier [delay_control]`
                             let edge = self.parse_clocking_skew_edge();
-                            if dir_out {
+                            if dir_in {
+                                default_input_edge = edge;
+                            } else {
                                 default_output_edge = edge;
                             }
                             if self.at(TokenKind::Hash) {
@@ -2735,6 +2738,16 @@ impl Parser {
                         _ => {
                             self.bump();
                         }
+                    }
+                }
+                // §14.3: an explicit signal skew overrides the entire default.
+                // Keep effective input edges in the existing per-signal field.
+                for signal in &mut signals {
+                    if signal.direction == PortDirection::Input
+                        && signal.skew.is_none()
+                        && signal.skew_edge.is_none()
+                    {
+                        signal.skew_edge = default_input_edge;
                     }
                 }
                 self.expect(TokenKind::KwEndclocking);
