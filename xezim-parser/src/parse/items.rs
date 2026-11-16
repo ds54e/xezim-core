@@ -1015,14 +1015,24 @@ impl Parser {
     /// (`= expr`); the port name is the last identifier before the default
     /// (or before the segment end). Called with the cursor ON the `(`.
     /// The formal port names of a property or sequence declaration, and its
-    /// §16.8.2 `local [input]` formals with their types.
-    fn parse_sva_port_names(&mut self) -> (Vec<Identifier>, Vec<(Identifier, DataType)>) {
+    /// §16.8.2 `local [input]` formals with their types, and §16.8 defaults.
+    fn parse_sva_port_names(
+        &mut self,
+    ) -> (
+        Vec<Identifier>,
+        Vec<(Identifier, DataType)>,
+        Vec<(String, Expression)>,
+    ) {
+        let mut defaults = Vec::new();
+        let mut default_type = None;
+        let mut sequence_or_property = false;
         let mut ports: Vec<Identifier> = Vec::new();
         let mut local_ports: Vec<(Identifier, DataType)> = Vec::new();
         self.bump(); // (
         let mut depth: i32 = 1;
         let mut last_ident: Option<Identifier> = None;
         let mut in_default = false;
+        let mut unrepresented_formal = false;
         let mut port_start = true;
         // The type of the current formal when it is a `local [input]` one.
         let mut local_type: Option<DataType> = None;
@@ -1071,11 +1081,43 @@ impl Parser {
                 };
                 // `local output` / `local inout` formals stay plain
                 // substitutions (not modelled as locals).
+                sequence_or_property = false;
                 local_type = input.then_some(dt);
+                default_type = None;
+                unrepresented_formal = false;
+            } else if port_start && depth == 1 {
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::KwUntyped
+                        | TokenKind::KwSequence
+                        | TokenKind::KwProperty
+                        | TokenKind::KwEvent
+                ) {
+                    default_type = None;
+                    // Event defaults need event-expression binding (including iff),
+                    // which scalar expression substitution does not represent.
+                    unrepresented_formal = self.at(TokenKind::KwEvent);
+                    sequence_or_property = matches!(
+                        self.current_kind(),
+                        TokenKind::KwSequence | TokenKind::KwProperty
+                    );
+                    self.bump();
+                } else if self.is_type_start()
+                    && !matches!(
+                        self.peek_kind(),
+                        TokenKind::Comma | TokenKind::RParen | TokenKind::Assign
+                    )
+                {
+                    // §16.8.1: a declared type also applies to following formals.
+                    sequence_or_property = false;
+                    default_type = Some(self.parse_data_type());
+                    unrepresented_formal = false;
+                }
             }
             port_start = false;
             match self.current_kind() {
                 TokenKind::LParen | TokenKind::LBracket => {
+                    unrepresented_formal |= depth == 1 && last_ident.is_some() && !in_default;
                     depth += 1;
                     self.bump();
                 }
@@ -1103,13 +1145,91 @@ impl Parser {
                     self.bump();
                 }
                 TokenKind::Assign if depth == 1 => {
-                    // default value: the name is already in last_ident;
-                    // idents inside the default must not overwrite it.
-                    in_default = true;
                     self.bump();
+                    // §16.8/§16.12: retain the default actual for substitution.
+                    let saved_sva = self.in_sva_seq;
+                    let saved_pos = self.pos;
+                    let saved_diag = self.diagnostics.len();
+                    in_default = true;
+                    self.in_sva_seq = true;
+                    let mut default = self.parse_expression();
+                    self.in_sva_seq = saved_sva;
+                    if self.diagnostics.len() != saved_diag
+                        || !matches!(self.current_kind(), TokenKind::Comma | TokenKind::RParen)
+                    {
+                        // Keep the existing token-skip fallback for unsupported expressions.
+                        self.pos = saved_pos;
+                        self.diagnostics.truncate(saved_diag);
+                        continue;
+                    }
+                    // §16.8/§9.4.2.3: an untyped iff can be an event filter,
+                    // not a Boolean equivalence. Keep the event binding fallback.
+                    let mut outer = &default;
+                    while let ExprKind::Paren(inner) = &outer.kind {
+                        outer = inner;
+                    }
+                    if !sequence_or_property
+                        && matches!(
+                            outer.kind,
+                            ExprKind::Binary {
+                                op: BinaryOp::Iff,
+                                ..
+                            }
+                        )
+                    {
+                        continue;
+                    }
+                    // §16.8: untyped arithmetic needs a self-determined cast
+                    // before substitution. Keep the old path until that type
+                    // is represented, rather than widening in the body's context.
+                    if default_type.is_none()
+                        && local_type.is_none()
+                        && !sequence_or_property
+                        && matches!(
+                            outer.kind,
+                            ExprKind::Binary {
+                                op: BinaryOp::Add
+                                    | BinaryOp::Sub
+                                    | BinaryOp::Mul
+                                    | BinaryOp::Div
+                                    | BinaryOp::Mod
+                                    | BinaryOp::Power
+                                    | BinaryOp::ShiftLeft
+                                    | BinaryOp::ShiftRight
+                                    | BinaryOp::ArithShiftLeft
+                                    | BinaryOp::ArithShiftRight,
+                                ..
+                            }
+                        )
+                    {
+                        continue;
+                    }
+                    if let Some(dt) = &default_type {
+                        // §16.8.1/§16.12.18: reuse the existing type-cast path.
+                        let span = default.span;
+                        default = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$__xz_type_cast".to_string(),
+                                args: vec![
+                                    Expression::new(
+                                        ExprKind::TypeLiteral(Box::new(dt.clone())),
+                                        span,
+                                    ),
+                                    default,
+                                ],
+                            },
+                            span,
+                        );
+                    }
+                    // Keep the old binding when a type or unpacked dimension was skipped;
+                    // the scalar type does not represent that formal's conversion.
+                    if !unrepresented_formal && let Some(id) = &last_ident {
+                        defaults.push((id.name.clone(), default));
+                    }
                 }
                 TokenKind::Identifier | TokenKind::EscapedIdentifier => {
                     if !in_default {
+                        unrepresented_formal |= last_ident.is_some();
                         last_ident = Some(self.parse_identifier());
                     } else {
                         self.bump();
@@ -1120,7 +1240,7 @@ impl Parser {
                 }
             }
         }
-        (ports, local_ports)
+        (ports, local_ports, defaults)
     }
 
     /// Whether the bracket groups starting `n` tokens ahead are followed by
@@ -2776,10 +2896,10 @@ impl Parser {
                 let start = self.current().span.start;
                 self.bump();
                 let name = self.parse_identifier();
-                let (ports, local_ports) = if self.at(TokenKind::LParen) {
+                let (ports, local_ports, defaults) = if self.at(TokenKind::LParen) {
                     self.parse_sva_port_names()
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new())
                 };
                 self.expect(TokenKind::Semicolon);
                 // §16.10: assertion-local variable declarations.
@@ -2869,6 +2989,7 @@ impl Parser {
                 Some(ModuleItem::PropertyDeclaration(PropertyDeclaration {
                     name,
                     ports,
+                    defaults,
                     items,
                     body: body_expr,
                     endlabel,
@@ -2880,10 +3001,10 @@ impl Parser {
                 let start = self.current().span.start;
                 self.bump();
                 let name = self.parse_identifier();
-                let (ports, local_ports) = if self.at(TokenKind::LParen) {
+                let (ports, local_ports, defaults) = if self.at(TokenKind::LParen) {
                     self.parse_sva_port_names()
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new())
                 };
                 self.expect(TokenKind::Semicolon);
                 // §16.10: assertion-local variable declarations.
@@ -2945,6 +3066,7 @@ impl Parser {
                 Some(ModuleItem::SequenceDeclaration(SequenceDeclaration {
                     name,
                     ports,
+                    defaults,
                     items,
                     body: body_expr,
                     endlabel,

@@ -4141,6 +4141,8 @@ pub struct ElaboratedModule {
     /// §16.6: formal port NAMES of each named property/sequence, keyed like
     /// `property_decls`. Empty vec for portless declarations.
     pub property_params: HashMap<String, Vec<String>>,
+    /// §16.8/§16.12: declaration-scope default actuals for the existing binders.
+    pub property_defaults: HashMap<String, HashMap<String, Expression>>,
     /// LRM §8.4: for an array-of-class-handles (`T arr[N]`,
     /// `T arr[];`), record the element's class name so runtime
     /// `arr[i] = new(...)` can construct an instance of that class.
@@ -4667,6 +4669,7 @@ impl ElaboratedModule {
             checker_decls: HashMap::default(),
             property_decls: HashMap::default(),
             property_params: HashMap::default(),
+            property_defaults: HashMap::default(),
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
             coll_shapes: HashMap::default(),
@@ -6137,6 +6140,46 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
     // maps a module-level declaration populates, so an importing module's
     // `assert property (p(...))` resolves them.
     for p in &pkgs {
+        // §16.8: defaults keep the package's own names under importer shadowing.
+        let has_defaults = p.items.iter().any(|item| match item {
+            PackageItem::Property(d) => !d.defaults.is_empty(),
+            PackageItem::Sequence(d) => !d.defaults.is_empty(),
+            _ => false,
+        });
+        let default_names = if has_defaults {
+            p.items
+                .iter()
+                .filter(|item| matches!(item, PackageItem::Parameter(_)))
+                .flat_map(package_item_names)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let default_prefix = format!("{}::", p.name.name);
+        let rewrite_default = |(name, expr): &(String, Expression)| {
+            // Only direct package parameters have a qualified value here. Preserve
+            // the old binding for defaults needing package-variable/import resolution.
+            let mut resolved = true;
+            for_each_sub_expr(expr, &mut |e| {
+                if let ExprKind::Ident(h) = &e.kind {
+                    resolved &= h.root.is_none()
+                        && h.path.len() == 1
+                        && default_names.contains(&h.path[0].name.name);
+                }
+            });
+            resolved.then(|| {
+                (
+                    name.clone(),
+                    rewrite_expr(
+                        expr,
+                        &default_prefix,
+                        &HashMap::default(),
+                        &default_names,
+                        &HashMap::default(),
+                    ),
+                )
+            })
+        };
         for item in &p.items {
             match item {
                 crate::ast::decl::PackageItem::Property(pd) => {
@@ -6145,6 +6188,11 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                         elab.property_decls
                             .entry(pd.name.name.clone())
                             .or_insert_with(|| body.clone());
+                        elab.property_defaults
+                            .entry(pd.name.name.clone())
+                            .or_insert_with(|| {
+                                pd.defaults.iter().filter_map(rewrite_default).collect()
+                            });
                         elab.property_params
                             .entry(pd.name.name.clone())
                             .or_insert_with(|| pd.ports.iter().map(|p| p.name.clone()).collect());
@@ -6156,6 +6204,11 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                         elab.property_decls
                             .entry(sd.name.name.clone())
                             .or_insert_with(|| body.clone());
+                        elab.property_defaults
+                            .entry(sd.name.name.clone())
+                            .or_insert_with(|| {
+                                sd.defaults.iter().filter_map(rewrite_default).collect()
+                            });
                         elab.property_params
                             .entry(sd.name.name.clone())
                             .or_insert_with(|| sd.ports.iter().map(|p| p.name.clone()).collect());
@@ -9231,6 +9284,9 @@ fn check_module_use_before_decl(
                     ModuleItem::ClassDeclaration(c) => self.class(c, scope),
                     ModuleItem::AssertionItem(a) => self.assertion(a, scope),
                     ModuleItem::PropertyDeclaration(p) => {
+                        for (_, e) in &p.defaults {
+                            self.expr(e, scope);
+                        }
                         let mut inner = scope.clone();
                         for p in &p.ports {
                             inner.locals.insert(p.name.clone());
@@ -9241,6 +9297,9 @@ fn check_module_use_before_decl(
                         }
                     }
                     ModuleItem::SequenceDeclaration(p) => {
+                        for (_, e) in &p.defaults {
+                            self.expr(e, scope);
+                        }
                         let mut inner = scope.clone();
                         for p in &p.ports {
                             inner.locals.insert(p.name.clone());
@@ -14539,6 +14598,8 @@ pub fn elaborate_module_with_defs(
                     // `assert property (s)` style references.
                     elab.property_decls
                         .insert(sd.name.name.clone(), body.clone());
+                    elab.property_defaults
+                        .insert(sd.name.name.clone(), sd.defaults.iter().cloned().collect());
                     elab.property_params.insert(
                         sd.name.name.clone(),
                         sd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -14550,6 +14611,8 @@ pub fn elaborate_module_with_defs(
                 if let Some(body) = &pd.body {
                     elab.property_decls
                         .insert(pd.name.name.clone(), body.clone());
+                    elab.property_defaults
+                        .insert(pd.name.name.clone(), pd.defaults.iter().cloned().collect());
                     elab.property_params.insert(
                         pd.name.name.clone(),
                         pd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -20456,6 +20519,8 @@ fn elaborate_items(
                     // `assert property (s)` style references.
                     elab.property_decls
                         .insert(sd.name.name.clone(), body.clone());
+                    elab.property_defaults
+                        .insert(sd.name.name.clone(), sd.defaults.iter().cloned().collect());
                     elab.property_params.insert(
                         sd.name.name.clone(),
                         sd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -20467,6 +20532,8 @@ fn elaborate_items(
                 if let Some(body) = &pd.body {
                     elab.property_decls
                         .insert(pd.name.name.clone(), body.clone());
+                    elab.property_defaults
+                        .insert(pd.name.name.clone(), pd.defaults.iter().cloned().collect());
                     elab.property_params.insert(
                         pd.name.name.clone(),
                         pd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -36720,10 +36787,16 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
         ModuleItem::PropertyDeclaration(p) => {
             p.items = p.items.iter().map(gen_stmt).collect();
             p.body = p.body.as_ref().map(gen_expr);
+            for (_, e) in &mut p.defaults {
+                *e = gen_expr(e);
+            }
         }
         ModuleItem::SequenceDeclaration(p) => {
             p.items = p.items.iter().map(gen_stmt).collect();
             p.body = p.body.as_ref().map(gen_expr);
+            for (_, e) in &mut p.defaults {
+                *e = gen_expr(e);
+            }
         }
         ModuleItem::LetDeclaration(l) => {
             if let PortList::Ansi(ps) = &mut l.ports {
@@ -46586,14 +46659,14 @@ fn inline_module_items(
                     // locals and stay bare for the call-site substitution).
                     let named_sva = match sub_item {
                         ModuleItem::PropertyDeclaration(pd) => {
-                            Some((&pd.name.name, &pd.ports, &pd.body))
+                            Some((&pd.name.name, &pd.ports, &pd.body, &pd.defaults))
                         }
                         ModuleItem::SequenceDeclaration(sd) => {
-                            Some((&sd.name.name, &sd.ports, &sd.body))
+                            Some((&sd.name.name, &sd.ports, &sd.body, &sd.defaults))
                         }
                         _ => None,
                     };
-                    if let Some((name, ports, body)) = named_sva {
+                    if let Some((name, ports, body, defaults)) = named_sva {
                         let key = cat2(&inst_prefix, &name);
                         elab.sequences.insert(key.clone());
                         if let Some(body) = body {
@@ -46609,6 +46682,25 @@ fn inline_module_items(
                                 &sva_ports,
                                 &sva_locals,
                                 &sub_interface_map,
+                            );
+                            // Defaults see the declaration scope, without formal shadowing (§16.8).
+                            elab.property_defaults.insert(
+                                key.clone(),
+                                defaults
+                                    .iter()
+                                    .map(|(n, e)| {
+                                        (
+                                            n.clone(),
+                                            rewrite_expr(
+                                                e,
+                                                &inst_prefix,
+                                                &rewrite_port_map,
+                                                &prepared_sub.local_names,
+                                                &sub_interface_map,
+                                            ),
+                                        )
+                                    })
+                                    .collect(),
                             );
                             elab.property_decls.insert(key.clone(), body);
                             elab.property_params

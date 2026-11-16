@@ -3189,10 +3189,12 @@ impl Rw<'_> {
             }
             ModuleItem::AssertionItem(a) => self.assertion(a),
             ModuleItem::PropertyDeclaration(p) => {
+                p.defaults.iter_mut().for_each(|(_, e)| self.expr(e));
                 p.items.iter_mut().for_each(|s| self.stmt(s));
                 self.opt(&mut p.body);
             }
             ModuleItem::SequenceDeclaration(p) => {
+                p.defaults.iter_mut().for_each(|(_, e)| self.expr(e));
                 p.items.iter_mut().for_each(|s| self.stmt(s));
                 self.opt(&mut p.body);
             }
@@ -3344,10 +3346,12 @@ impl Rw<'_> {
                 self.dtype(&mut n.data_type);
             }
             PackageItem::Property(p) => {
+                p.defaults.iter_mut().for_each(|(_, e)| self.expr(e));
                 p.items.iter_mut().for_each(|s| self.stmt(s));
                 self.opt(&mut p.body);
             }
             PackageItem::Sequence(p) => {
+                p.defaults.iter_mut().for_each(|(_, e)| self.expr(e));
                 p.items.iter_mut().for_each(|s| self.stmt(s));
                 self.opt(&mut p.body);
             }

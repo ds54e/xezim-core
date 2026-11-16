@@ -903,6 +903,8 @@ pub struct PropertyDeclaration {
     /// `assert property (p(actuals))` can substitute formals→actuals.
     #[cfg_attr(feature = "serde", serde(default))]
     pub ports: Vec<Identifier>,
+    /// §16.8/§16.12: default actuals, resolved in the declaration scope.
+    pub defaults: Vec<(String, super::expr::Expression)>,
     pub items: Vec<super::stmt::Statement>, // Approximate property body as statements for parsing
     /// LRM §16.6 property body, captured when it matches the common
     /// `@(clk_event) <expr>` shape. Used by `assert property (p_name)`
@@ -927,6 +929,8 @@ pub struct SequenceDeclaration {
     /// PropertyDeclaration::ports).
     #[cfg_attr(feature = "serde", serde(default))]
     pub ports: Vec<Identifier>,
+    /// §16.8/§16.12: default actuals, resolved in the declaration scope.
+    pub defaults: Vec<(String, super::expr::Expression)>,
     pub items: Vec<super::stmt::Statement>, // Approximate sequence body as statements
     /// LRM §16.5 — sequence body when it matches the common
     /// `@(clk) <expr>` shape (an `SvaClocked` wrapper). Used for
