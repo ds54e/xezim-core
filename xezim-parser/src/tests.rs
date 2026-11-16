@@ -1220,3 +1220,40 @@ fn ansi_port_inherits_only_when_it_omits_direction_kind_and_type() {
     assert_eq!(p[1].direction, Some(PortDirection::Input));
     assert!(p[1].net_type.is_none());
 }
+
+/// §16.8/§16.12: keep names and default expressions, including commas nested
+/// in a concatenation and `$` as an untyped delay-range upper bound.
+#[test]
+fn sva_formal_defaults_are_retained() {
+    use crate::ast::expr::ExprKind;
+    for kind in ["property", "sequence"] {
+        let source = format!(
+            "module m; bit clk, a, b; {kind} p(x, y={{a,b}}, n=$); \
+             @(posedge clk) x ##[1:n] (y == 0); end{kind} endmodule"
+        );
+        let result = parse(&source);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let Description::Module(m) = &result.source.descriptions[0] else {
+            panic!("module");
+        };
+        let (ports, defaults) = m
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ModuleItem::PropertyDeclaration(p) => Some((&p.ports, &p.defaults)),
+                ModuleItem::SequenceDeclaration(s) => Some((&s.ports, &s.defaults)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            ports.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["x", "y", "n"]
+        );
+        assert_eq!(
+            defaults.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["y", "n"]
+        );
+        assert!(matches!(defaults[0].1.kind, ExprKind::Concatenation(_)));
+        assert!(matches!(defaults[1].1.kind, ExprKind::Dollar));
+    }
+}
