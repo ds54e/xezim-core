@@ -40607,6 +40607,7 @@ fn inline_module_items(
     // End offset of the process/instance items seen so far (see
     // `ElabInstance::src_pos`).
     let mut items_end = 0usize;
+    let mut udp_time_scope = None;
     for item in &prepared_source.effective_items {
         let item_floor = items_end;
         items_end = items_end.max(match item {
@@ -40637,10 +40638,24 @@ fn inline_module_items(
             // instantiation. Lower it into a flattened `UdpInstance` (truth
             // table + resolved terminal nets) instead of inlining module items.
             if let Some(Definition::Udp(udp)) = definitions.get(sub_mod_name).copied() {
+                // Resolve once per enclosing module, only if it contains UDPs.
+                // Match the gate/assign fallback for definitions without a
+                // captured timescale (library cells and nested modules).
+                let time_scope = *udp_time_scope.get_or_insert_with(|| {
+                    let tick = secs_to_exp(elab.tick_s);
+                    let (unit, prec) = elab
+                        .module_timescale_exp
+                        .get(source_def.name())
+                        .copied()
+                        .unwrap_or((tick, tick));
+                    let scale = 10_u64.saturating_pow((unit - tick).max(0) as u32);
+                    (exp_to_secs(unit), exp_to_secs(prec), scale)
+                });
                 lower_udp_instances(
                     elab,
                     udp,
                     inst,
+                    time_scope,
                     prefix,
                     &prepared_source.local_names,
                     interface_map,
@@ -52779,12 +52794,17 @@ fn lower_udp_instances(
     elab: &mut ElaboratedModule,
     udp: &crate::ast::decl::UdpDecl,
     inst: &ModuleInstantiation,
+    time_scope: (f64, f64, u64),
     prefix: &str,
     local_names: &std::collections::HashSet<String>,
     interface_map: &HashMap<String, String>,
 ) {
     use crate::ast::decl::PortConnection;
     let n_ports = udp.ports.len();
+    let (unit_s, prec_s, scale) = time_scope;
+    // §3.14.2: integer module units scale by an exact power of ten, including
+    // values wider than f64's mantissa. Retain saturation at the tick limit.
+    let integer_ticks = |d: u64| d.saturating_mul(scale);
     // Instance delay: `#(d)` or `#(rise, fall)` before the instance — scalar
     // time values in the enclosing module's time units (§28.16, §29.3).
     // A parameter it names (`#(D)`) belongs to the enclosing INSTANCE: bring
@@ -52795,8 +52815,56 @@ fn lower_udp_instances(
             crate::ast::decl::ParamConnection::Ordered(Some(
                 crate::ast::decl::ParamValue::Expr(e),
             )) => {
-                let e = rewrite_expr(e, prefix, &HashMap::default(), local_names, interface_map);
-                const_eval_i64_with_params(&e, Some(&elab.parameters)).map(|d| d.max(0) as u64)
+                let mut e =
+                    rewrite_expr(e, prefix, &HashMap::default(), local_names, interface_map);
+                // §28.16 / §29.8 / §3.14.1–§3.14.2: UDP delays count the
+                // enclosing definition's timeunit, rounded to its precision.
+                // Keep main's fallback for unknown/nonconstant expressions.
+                if matches!(e.kind, ExprKind::Number(NumberLiteral::Integer { .. })) {
+                    return const_eval_i64_with_params(&e, Some(&elab.parameters))
+                        .map(|d| integer_ticks(d.max(0) as u64));
+                }
+                if !matches!(e.kind, ExprKind::Number(NumberLiteral::Time(_))) {
+                    let constant = is_const_expr(&e, &elab.parameters)
+                        || matches!(&e.kind, ExprKind::Replication { count, exprs }
+                            if is_const_expr(count, &elab.parameters)
+                                && exprs.iter().all(|e| is_const_expr(e, &elab.parameters)))
+                        || matches!(&e.kind, ExprKind::RangeSelect { expr, left, right, .. }
+                            if is_const_expr(expr, &elab.parameters)
+                                && is_const_expr(left, &elab.parameters)
+                                && is_const_expr(right, &elab.parameters));
+                    let v = if constant {
+                        eval_const_expr_val(&e, &elab.parameters)
+                    } else if let Some(v) = const_parameter_path(&e, Some(&elab.parameters))
+                        .and_then(|name| {
+                            elab.parameters
+                                .get(&name)
+                                .or_else(|| elab.parameters.get(&name.replace('.', "::")))
+                        })
+                    {
+                        v.clone()
+                    } else {
+                        return const_eval_i64_with_params(&e, Some(&elab.parameters))
+                            .map(|d| d.max(0) as u64);
+                    };
+                    if v.has_unknown() {
+                        return const_eval_i64_with_params(&e, Some(&elab.parameters))
+                            .map(|d| d.max(0) as u64);
+                    }
+                    if !v.is_real {
+                        // Retain the existing negative integer clamp, including
+                        // expressions interpreted as signed by the old helper.
+                        if const_eval_i64_with_params(&e, Some(&elab.parameters))
+                            .is_some_and(|d| d < 0)
+                        {
+                            return Some(0);
+                        }
+                        return Some(integer_ticks(v.to_u64()?));
+                    }
+                    e = Expression::new(ExprKind::Number(NumberLiteral::Real(v.to_f64())), e.span);
+                }
+                rewrite_delay_expr(&mut e, unit_s, prec_s, elab.tick_s);
+                Some(eval_const_expr(&e, &elab.parameters))
             }
             _ => None,
         }
