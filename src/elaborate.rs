@@ -4395,6 +4395,13 @@ pub struct ElaboratedModule {
     /// Used to enforce §6.5 driver-conflict rules only against variables.
     #[serde(default)]
     pub nets: crate::shared_names::SharedNameSet,
+    /// User-defined nets registered by the generate declaration arm, for the
+    /// §6.5 mixed-driver check before inlining.
+    #[serde(skip)]
+    generated_nettype_nets: HashSet<String>,
+    /// Source declarations registered by the module nettype prepass.
+    #[serde(skip)]
+    registered_nettype_decls: HashMap<String, Span>,
     /// Subset of `nets` that §6.10 created IMPLICITLY (referenced but never
     /// declared). `--primitive-verbose` flags UDP terminals landing on one of
     /// these — the classic signature of a dropped/unresolved vendor cell.
@@ -4904,6 +4911,8 @@ impl ElaboratedModule {
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: Default::default(),
+            generated_nettype_nets: HashSet::default(),
+            registered_nettype_decls: HashMap::default(),
             implicit_nets: HashSet::default(),
             interconnect_nets: HashSet::default(),
             elab_diagnostics: Vec::new(),
@@ -11429,6 +11438,7 @@ pub fn elaborate_module_with_defs(
     for item in module.items() {
         if let ModuleItem::NettypeDeclaration(nd) = item {
             let key = nd.name.name.clone();
+            elab.registered_nettype_decls.insert(key.clone(), nd.name.span);
             register_nettype(
                 &mut elab,
                 &mut nettype_info,
@@ -15371,7 +15381,8 @@ pub fn elaborate_module_with_defs(
 
     // IEEE 1800-2017 §6.5: a variable cannot have multiple continuous drivers,
     // nor mix continuous and procedural drivers.
-    validate_driver_conflicts(&elab, module, all_defs)?;
+    let generated_nettype_nets = std::mem::take(&mut elab.generated_nettype_nets);
+    validate_driver_conflicts(&elab, module, all_defs, &generated_nettype_nets)?;
 
     // IEEE 1800-2017 §8.21/§8.26: class instantiation legality.
     let scope_typedefs = all_defs.map(|defs| non_class_typedef_names(defs, &module));
@@ -18039,8 +18050,12 @@ fn validate_driver_conflicts(
     elab: &ElaboratedModule,
     module: Definition,
     all_defs: Option<&HashMap<String, Definition>>,
+    generated_nettype_nets: &HashSet<String>,
 ) -> Result<(), String> {
-    let is_var = |n: &str| elab.signals.contains_key(n) && !elab.nets.contains(n);
+    let track_writers = |n: &str| {
+        elab.signals.contains_key(n)
+            && (!elab.nets.contains(n) || generated_nettype_nets.contains(n))
+    };
     // (writer index, kind, span) per variable.
     let mut writers: HashMap<String, Vec<(usize, WriterKind, Option<(i64, i64)>)>> =
         HashMap::default();
@@ -18049,7 +18064,7 @@ fn validate_driver_conflicts(
         let mut spans = Vec::new();
         lvalue_write_spans(&ca.lhs, elab, &mut spans);
         for (n, sp) in spans {
-            if is_var(&n) {
+            if track_writers(&n) {
                 writers
                     .entry(n)
                     .or_default()
@@ -18081,7 +18096,7 @@ fn validate_driver_conflicts(
                         }
                     }
                     for (n, sp) in spans {
-                        if is_var(&n) {
+                        if track_writers(&n) {
                             writers
                                 .entry(n)
                                 .or_default()
@@ -18101,7 +18116,7 @@ fn validate_driver_conflicts(
             collect_stmt_declared_names(stmt, &mut local);
             let mut seen: HashSet<(String, Option<(i64, i64)>)> = HashSet::default();
             for (n, sp) in spans {
-                if is_var(&n) && !local.contains(&n) && seen.insert((n.clone(), sp)) {
+                if track_writers(&n) && !local.contains(&n) && seen.insert((n.clone(), sp)) {
                     writers.entry(n).or_default().push((*next, kind, sp));
                 }
             }
@@ -18133,6 +18148,12 @@ fn validate_driver_conflicts(
     names.sort();
     for n in names {
         let ws = &writers[n];
+        let generated_net = generated_nettype_nets.contains(n);
+        if generated_net
+            && ws.iter().all(|&(_, kind, _)| matches!(kind, WriterKind::Continuous | WriterKind::Port))
+        {
+            continue;
+        }
         for (i, &(pa, ka, sa)) in ws.iter().enumerate() {
             for &(pb, kb, sb) in &ws[i + 1..] {
                 if pa == pb || !overlap(sa, sb) {
@@ -18141,6 +18162,13 @@ fn validate_driver_conflicts(
                 let sp = if sa.is_some() { sa } else { sb };
                 use WriterKind as W;
                 let msg = match (ka, kb) {
+                    // §6.5: a net may have multiple continuous drivers.
+                    (W::Continuous | W::Port, W::Continuous | W::Port) if generated_net => {
+                        continue;
+                    }
+                    (W::Continuous, _) | (_, W::Continuous) if generated_net => {
+                        format!("Net '{}' is the target of a procedural assignment (IEEE 1800-2023 §6.5)", show(n, sp))
+                    }
                     // A port beside a procedural write is accepted.
                     (W::Port, W::Comb | W::Ff | W::Other)
                     | (W::Comb | W::Ff | W::Other, W::Port) => {
@@ -20059,7 +20087,38 @@ fn elaborate_items(
                     }
                 }
                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
-                let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                // §6.6.7, §23.9: the registered nettype must be the type
+                // this declaration binds to. A lexical typedef or type
+                // parameter may shadow a compilation-unit nettype.
+                let registered_name = match &dd.data_type {
+                    DataType::TypeReference { name, .. } => {
+                        let registered = if name.scopes.is_empty() {
+                            elab.nettype_resolvers.contains_key(&name.name.name)
+                        } else {
+                            elab.nettype_resolvers.contains_key(&name.qualified())
+                        };
+                        registered.then_some(name)
+                    }
+                    _ => None,
+                };
+                let nettype_net = !dd.var_kw
+                    && registered_name.is_some_and(|name| {
+                        name.bound.as_decl().is_none_or(|id| {
+                            crate::scope_tree::tree_of(&elab.name).is_some_and(|tree| {
+                                tree.decls.get(id.0 as usize).is_some_and(|d| {
+                                    d.kind == DeclKind::Nettype
+                                        && elab.registered_nettype_decls.get(&d.name) == Some(&d.span)
+                                })
+                            })
+                        })
+                    });
+                // A shadowing variable can still see the nettype's entry in
+                // the shared typedef table. Preserve its existing treatment.
+                let is_real = if registered_name.is_some() && !nettype_net {
+                    is_type_real(&dd.data_type)
+                } else {
+                    is_type_real_resolved(&dd.data_type, &elab.typedef_types)
+                };
                 for decl in &dd.declarators {
                     // §6.18, §7.4.5: a variable of a dimensioned typedef takes
                     // the typedef's unpacked dimensions after its own, as the
@@ -20091,6 +20150,10 @@ fn elaborate_items(
                             decl.name.span,
                             "net",
                         ));
+                    }
+                    if nettype_net {
+                        elab.nets.insert(decl.name.name.clone());
+                        elab.generated_nettype_nets.insert(decl.name.name.clone());
                     }
                     let shape_dims = normalize_unpacked_dims(
                         &decl.dimensions,
@@ -20502,10 +20565,25 @@ fn elaborate_items(
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());
                         }
+                        // §6.6.7, §10.3.1: a net declaration assignment
+                        // contributes a continuous driver to the resolver.
+                        if nettype_net && let Some(init) = decl.init.as_deref() {
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                gate_delay_fall: None,
+                                delay_select: None,
+                                origin: Some((init.span, top_origin_scope())),
+                                lhs: make_ident_expr(&decl.name.name),
+                                rhs: init.clone(),
+                                delay: 0,
+                                rhs_parent_scoped: true,
+                                delay_fall: None,
+                                delay_off: None,
+                            });
+                        }
                         // §6.8/§27: a generate-body initializer also executes
                         // before initial processes. Constant folding cannot
                         // construct an object or call a runtime function.
-                        if let Some(init) = procedural_init {
+                        if let Some(init) = procedural_init.filter(|_| !nettype_net) {
                             if dd.const_kw {
                                 elab.const_decl_inits.insert(decl.name.name.clone());
                             }
