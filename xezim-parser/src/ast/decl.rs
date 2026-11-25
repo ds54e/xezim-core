@@ -1314,6 +1314,9 @@ pub struct ContinuousAssign {
     /// Third delay: applied to a transition to z.
     #[cfg_attr(feature = "serde", serde(default))]
     pub delay_off: Option<Box<Expression>>,
+    /// Generate-scope copy of the single delay for nettype array-cell stages.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub array_stage_delay: Option<Box<Expression>>,
     pub assignments: Vec<(Expression, Expression)>,
     pub span: Span,
 }

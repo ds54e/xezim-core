@@ -356,6 +356,34 @@ pub(super) fn make_net_lhs_expr(name: &str) -> Expression {
     make_ident_expr(name)
 }
 
+/// A nettype's value can itself be an unpacked aggregate (§6.6.7). Keep
+/// those values on their existing path, even through typedefs.
+fn is_nonaggregate_nettype_array_element(elab: &ElaboratedModule, array: &str) -> bool {
+    let Some(mut dt) = elab.var_decl_types.get(array) else {
+        return false;
+    };
+    for _ in 0..64 {
+        match dt {
+            DataType::IntegerAtom { .. }
+            | DataType::IntegerVector { .. }
+            | DataType::Enum(_)
+            | DataType::Real { .. } => return true,
+            DataType::Struct(s) => return s.packed,
+            DataType::TypeReference { name, .. }
+                if lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                    .is_none_or(Vec::is_empty) =>
+            {
+                let Some(inner) = lookup_scoped_type(name, &elab.typedef_types) else {
+                    return false;
+                };
+                dt = inner;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Qualify unscoped type keys in a resolved-nettype struct driver pattern from
 /// `scope` (for example, a module type parameter or local typedef `T:` inside an
 /// inlined child instance whose folded resolver CA has no origin scope).
@@ -768,12 +796,32 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // A member of one too (`u.p.V`): a port connection taken apart.
             // §6.6.8: an element select of a nettype ARRAY (`a[0]`) names that
             // element's resolvable net too.
-            if driver_net(elab, &lhs, &pca.ctx.prefix).is_some_and(|n| {
-                net_resolver.contains_key(&n)
+            if let Some(name) = driver_net(elab, &lhs, &pca.ctx.prefix).filter(|n| {
+                net_resolver.contains_key(n)
                     || n.match_indices('.')
                         .any(|(i, _)| net_resolver.contains_key(&n[..i]))
             }) {
                 let ca = pca.materialize(&elab.parameters);
+                // §6.7.2: collect a whole-array body drive under its element keys.
+                if let Some((_, scope)) = ca.origin()
+                    && ca.delay() == 0
+                    && ca.delay_fall().is_none()
+                    && ca.delay_off().is_none()
+                    && ca.delay_exprs().is_none()
+                    && elab.arrays.contains_key(&name)
+                    && elab.unpacked_decl_dims.get(&name).is_some_and(|dims| dims.len() == 1)
+                    && net_resolver.get(&name).is_some_and(|r| !r.is_empty())
+                    && is_nonaggregate_nettype_array_element(elab, &name)
+                    && let Some(parts) = expanded_array_assign_parts(&ca, elab)
+                    && parts.iter().all(|part| {
+                        // Respect the escaped-name collision guard for every cell.
+                        driver_net(elab, &part.lhs_expr(), scope)
+                            .is_some_and(|n| net_resolver.contains_key(&n))
+                    })
+                {
+                    elab.continuous_assigns.extend(parts);
+                    continue;
+                }
                 elab.continuous_assigns.push(ca);
             } else {
                 elab.pending_cont_assign.push(pca);
@@ -862,9 +910,16 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     }
 
     // net -> its real drivers with their own delays and origin scope (§10.3.3).
-    let mut real_drivers: HashMap<String, Vec<(Expression, u64, String)>> = HashMap::default();
+    type DriverOrigin = (Span, std::sync::Arc<str>);
+    type Driver = (
+        Expression,
+        u64,
+        Option<DelayExpressions>,
+        Option<DriverOrigin>,
+        Option<std::sync::Arc<Expression>>,
+    );
+    let mut real_drivers: HashMap<String, Vec<Driver>> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
-    let mut delays: HashMap<String, u64> = HashMap::default();
     let mut kept: Vec<ContinuousAssignment> = Vec::new();
 
     // Member-wise drivers of resolver-less nets: net -> member -> count.
@@ -939,18 +994,22 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             }
         }
         let ca_delay = ca.delay();
-        if let std::collections::hash_map::Entry::Vacant(entry) = delays.entry(lhs_name.clone()) {
-            entry.insert(ca_delay);
+        if !real_drivers.contains_key(&lhs_name) {
             order.push(lhs_name.clone());
         }
-        let scope = ca
-            .origin()
-            .map(|(_, s)| s.to_string())
-            .unwrap_or_default();
+        let array_stage_delay = ca.array_stage_delay().cloned();
+        let delay_exprs = ca.delay_exprs().cloned();
+        let origin = ca.origin().cloned();
         real_drivers
             .entry(lhs_name)
             .or_default()
-            .push((ca.into_full().rhs, ca_delay, scope));
+            .push((
+                ca.into_full().rhs,
+                ca_delay,
+                delay_exprs,
+                origin,
+                array_stage_delay,
+            ));
     }
 
     // Choose a deterministic representative name for each component:
@@ -995,17 +1054,15 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     // CA order is observable through settle ordering). Each driver keeps its
     // OWN delay (§10.3.3: a delay on one continuous assignment delays that
     // driver's contribution alone, before resolution folds the others in).
-    let mut comp_drivers: HashMap<String, Vec<(Expression, u64, String)>> = HashMap::default();
+    let mut comp_drivers: HashMap<String, Vec<Driver>> = HashMap::default();
     let mut comp_first_lhs: HashMap<String, String> = HashMap::default();
     let mut comp_order: Vec<String> = Vec::new();
-    let mut comp_delay: HashMap<String, u64> = HashMap::default();
     for n in &order {
         let root_id = dsu.find(net_id[n.as_str()]);
         let rep = all_nets[dsu_rep[root_id as usize] as usize].clone();
         if !comp_drivers.contains_key(&rep) {
             comp_order.push(rep.clone());
             comp_first_lhs.insert(rep.clone(), n.clone());
-            comp_delay.insert(rep.clone(), *delays.get(n).unwrap_or(&0));
         }
         let ds = real_drivers.remove(n).unwrap_or_default();
         comp_drivers.entry(rep).or_default().extend(ds);
@@ -1123,7 +1180,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 lhs: &str,
                 rhs: Expression,
                 members: &NetMembers,
-                delay: u64,
+                (delay, delay_exprs, origin): (u64, Option<DelayExpressions>, Option<DriverOrigin>),
                 span: Span,
                 elab: &ElaboratedModule| {
         match members {
@@ -1200,35 +1257,72 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     None,
                     None,
                     None,
+                    delay_exprs,
                     None,
-                    None,
-                    None,
+                    origin,
                 ))
             }
         }
     };
 
+    fn stage_leaf(name: &str) -> &str {
+        let leaf = name.rsplit_once("::").map_or(name, |(_, leaf)| leaf);
+        leaf.rsplit_once('.').map_or(leaf, |(_, leaf)| leaf)
+    }
+    let mut occupied_stage_leaves = None;
+    let mut array_stage_leaves = None;
     for root in comp_order {
-        let drivers = comp_drivers.remove(&root).unwrap_or_default();
+        let mut drivers = comp_drivers.remove(&root).unwrap_or_default();
         let resolver = net_resolver[&root].clone();
         let span = drivers.first().map_or_else(Span::dummy, |d| d.0.span);
         let members = struct_members(elab, &root);
+        // §10.3.3: an unpacked array cell has no signal declaration of its
+        // own. Use the declared element type of a cell in the component,
+        // including when a merged port is the representative.
+        let stage_array = if members.is_none()
+            && drivers.len() > 1
+            && !resolver.is_empty()
+            && !elab.signals.contains_key(&root)
+        {
+            std::iter::once(&root)
+                .chain(comp_members.get(&root).into_iter().flatten())
+                .find_map(|name| {
+                    let (array, index) = name.strip_suffix(']')?.rsplit_once('[')?;
+                    let index = index.parse::<i64>().ok()?;
+                    let &(lo, hi, _) = elab.arrays.get(array)?;
+                    ((lo..=hi).contains(&index)
+                        && net_resolver.get(array) == Some(&resolver)
+                        && !elab.signals.contains_key(name)
+                        && !elab.var_decl_types.contains_key(name)
+                        && is_nonaggregate_nettype_array_element(elab, array))
+                    .then_some(array)
+                })
+        } else {
+            None
+        };
+        let folded_delay = drivers.first().map_or(0, |d| d.1);
+        if stage_array.is_some() {
+            for (_, delay, exprs, _, operand) in &mut drivers {
+                if let Some(operand) = operand {
+                    let (ticks, _, _, runtime) =
+                        cont_assign_delays([Some(operand), None, None], &elab.parameters);
+                    *delay = ticks;
+                    *exprs = runtime;
+                }
+            }
+        }
         // §10.3.3: a delay on one continuous assignment delays that driver's
         // contribution alone, before resolution folds the others in. A single
-        // folded resolver call can carry only ONE delay, so when a SCALAR
-        // net's drivers reach it with DIFFERENT delays (issue #1204), stage
+        // folded resolver call can carry only ONE delay, so when a net's
+        // drivers reach it with DIFFERENT delays (issue #1204), stage
         // each delayed driver onto its own `<net>$drv<k>` signal and fold the
         // stages undelayed; the resolver then re-evaluates the moment any
-        // driver's staged contribution changes. Uniform delays (all equal, 0
-        // included) keep the current single folded call — equal-delay drivers
-        // collapse exactly onto it.
+        // driver's staged contribution changes. Uniform delays keep the
+        // current single folded call and use the original delay.
         let staged = members.is_none()
             && drivers.len() > 1
-            && drivers[1..].iter().any(|(_, d, _)| *d != drivers[0].1);
-        let mut delay = comp_delay.remove(&root).unwrap_or(0);
-        if staged {
-            delay = 0;
-        }
+            && drivers[1..].iter().any(|d| d.1 != drivers[0].1);
+        let delay = if staged { 0 } else { folded_delay };
 
         let rhs = if resolver.is_empty() {
             // §6.6.7: a nettype declared without a resolution function accepts
@@ -1259,7 +1353,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         m,
                         net_expr(elab, src),
                         &mm,
-                        0,
+                        (0, None, None),
                         span,
                         elab,
                     );
@@ -1295,14 +1389,50 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // Each driver keeps its own fold contribution: its ORIGINAL value
             // when undelayed or uniform, or (when `staged`) the identifier of
             // its own `<net>$drv<k>` delay stage.
-            let mut stage_rhs: Vec<(String, Expression, u64)> = Vec::new();
+            let mut stage_rhs = Vec::new();
             let mut items: Vec<crate::ast::expr::AssignmentPatternItem> =
                 Vec::with_capacity(drivers.len());
             let mut k: u32 = 0;
-            for (driver, dly, driver_scope) in drivers.iter() {
+            for (driver, dly, delay_exprs, origin, _) in &drivers {
+                let driver_scope = origin.as_ref().map_or("", |(_, scope)| scope.as_ref());
                 let fold = if staged && *dly != 0 {
-                    let stage = format!("{root}$drv{k}");
-                    k += 1;
+                    // An escaped declaration can spell a stage name (§5.6.1).
+                    // Reserve leaves across scopes so a stage cannot hide it.
+                    let occupied = occupied_stage_leaves.get_or_insert_with(|| {
+                        elab.signals.keys()
+                            .chain(elab.var_decl_types.keys())
+                            .chain(elab.parameters.keys())
+                            .chain(elab.arrays.keys())
+                            .filter(|name| name.contains("$drv"))
+                            .map(|name| stage_leaf(name).to_owned())
+                            .collect::<HashSet<_>>()
+                    });
+                    // Reserve these names for the newly supported array-cell
+                    // stages. Scalar stages retain their existing name check.
+                    let array_occupied = stage_array.map(|_| {
+                        &*array_stage_leaves.get_or_insert_with(|| {
+                            elab.lets.keys()
+                                .chain(elab.sequences.iter())
+                                .chain(elab.property_decls.keys())
+                                .chain(elab.covergroups.keys())
+                                .chain(elab.clocking_blocks.keys())
+                                .chain(elab.typedef_types.keys())
+                                .chain(elab.typedefs.keys())
+                                .filter(|name| name.contains("$drv"))
+                                .map(|name| stage_leaf(name).to_owned())
+                                .collect::<HashSet<_>>()
+                        })
+                    });
+                    let stage = loop {
+                        let name = format!("{root}$drv{k}");
+                        k += 1;
+                        let leaf = stage_leaf(&name);
+                        if !occupied.contains(leaf)
+                            && !array_occupied.is_some_and(|names| names.contains(leaf))
+                        {
+                            break name;
+                        }
+                    };
                     // §10.3.3: synthesize the driver's own delay stage — a
                     // signal cloned from the net, driven by the driver's value
                     // behind its OWN delay, and read undelayed by the resolver.
@@ -1314,9 +1444,30 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         s.name = stage.clone().into();
                         s.direction = None;
                         elab.signals.insert(stage.clone(), s);
+                    } else if let Some(array) = stage_array {
+                        let width = elab.arrays[array].2;
+                        let dt = &elab.var_decl_types[array];
+                        let sig = Signal {
+                            name: stage.clone().into(),
+                            width,
+                            is_signed: is_type_signed_resolved(dt, &elab.typedef_types),
+                            is_real: is_type_real_resolved(dt, &elab.typedef_types),
+                            is_const: false,
+                            direction: None,
+                            value: default_value_for_type_resolved(dt, width, &elab.typedef_types).into(),
+                            type_name: get_type_name(resolve_typedef_chain(dt, &elab.typedef_types))
+                                .map(Into::into),
+                        };
+                        elab.signals.insert(stage.clone(), sig);
                     }
-                    stage_rhs.push((stage.clone(), driver.clone(), *dly));
-                    Expression::new(make_ident_expr(&stage).kind, driver.span)
+                    let stage_ref = Expression::new(make_ident_expr(&stage).kind, driver.span);
+                    // §10.3.3: the new array-cell stages keep the variable
+                    // delay and use the origin for its time scale. Scalar
+                    // stages keep the existing numeric delay.
+                    let delay_exprs = stage_array.and(delay_exprs.as_ref()).cloned();
+                    let delay_origin = delay_exprs.as_ref().and(origin.as_ref()).cloned();
+                    stage_rhs.push((stage, driver.clone(), (*dly, delay_exprs, delay_origin)));
+                    stage_ref
                 } else {
                     driver.clone()
                 };
@@ -1387,15 +1538,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 span,
             )
         };
-        emit(
-            &mut kept,
-            &root,
-            rhs,
-            &members,
-            delay,
-            span,
-            elab,
-        );
+        emit(&mut kept, &root, rhs, &members, (delay, None, None), span, elab);
 
         // Every other net in the component names the same physical node.
         // Scalar nets sharing an `alias_canon` group will be storage-aliased
@@ -1419,7 +1562,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     m,
                     net_expr(elab, &root),
                     &mm,
-                    0,
+                    (0, None, None),
                     span,
                     elab,
                 );
@@ -1483,7 +1626,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         dest,
                         net_expr(elab, src),
                         &single_mem,
-                        0,
+                        (0, None, None),
                         Span::dummy(),
                         elab,
                     );

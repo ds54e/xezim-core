@@ -488,6 +488,7 @@ impl<'a> Parser<'a> {
             delay: None,
             delay_fall: None,
             delay_off: None,
+            array_stage_delay: None,
             assignments: vec![(lhs, rhs)],
             span,
         }));

@@ -995,6 +995,9 @@ pub struct ContinuousAssignDelays {
     pub gate_delay_fall: Option<u64>,
     /// Runtime delay operands when any operand depends on simulation state.
     pub delay_exprs: Option<DelayExpressions>,
+    /// Generate-scope operand consumed when resolving nettype array-cell drivers.
+    #[serde(skip)]
+    array_stage_delay: Option<std::sync::Arc<Expression>>,
     /// §10.3.3 / §28.16: physical (low bit, width, vector shape) before
     /// driver widening. A bit-select is scalar; a width-one part is vector.
     pub delay_select: Option<(u32, u32, bool)>,
@@ -1006,6 +1009,7 @@ impl ContinuousAssignDelays {
             && self.delay_off.is_none()
             && self.gate_delay_fall.is_none()
             && self.delay_exprs.is_none()
+            && self.array_stage_delay.is_none()
             && self.delay_select.is_none()
     }
 }
@@ -1305,6 +1309,7 @@ impl ContinuousAssignment {
                 delay_off,
                 gate_delay_fall,
                 delay_exprs,
+                array_stage_delay: None,
                 delay_select,
             }))
         } else {
@@ -1567,6 +1572,9 @@ impl ContinuousAssignment {
                 self.set_delay_fall(d.delay_fall());
                 self.set_delay_off(d.delay_off());
                 self.set_delay_exprs(d.delay_exprs().cloned());
+                if let Some(delay) = d.delays().and_then(|d| d.array_stage_delay.as_ref()) {
+                    self.set_array_stage_delay(std::sync::Arc::clone(delay));
+                }
                 self.set_origin(d.origin().cloned());
                 self.set_rhs_parent_scoped(d.rhs_parent_scoped);
             }
@@ -2075,6 +2083,7 @@ pub struct PendingContAssignExtras {
     /// §10.3.3 fall / turn-off delays of the `#(rise, fall[, turnoff])` form.
     pub delay_fall_source: Option<std::rc::Rc<Expression>>,
     pub delay_off_source: Option<std::rc::Rc<Expression>>,
+    pub array_stage_delay: Option<std::rc::Rc<Expression>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2114,6 +2123,7 @@ impl PendingContAssign {
                 delay_source,
                 delay_fall_source,
                 delay_off_source,
+                array_stage_delay: None,
             }))
         } else {
             None
@@ -2325,28 +2335,27 @@ impl PendingContAssign {
         root_mark_hier_ca_rhs(&self.lhs_source, &mut rhs, &|_| false, &|n| {
             self.ctx.upward.borrow().packages.contains(n)
         });
+        let rewrite_delay = |d: &Expression| {
+            rewrite_expr(
+                d,
+                &self.ctx.prefix,
+                &self.ctx.port_map,
+                &self.ctx.local_names,
+                &self.ctx.interface_map,
+            )
+        };
         let operands = [
             self.delay_source(),
             self.delay_fall_source(),
             self.delay_off_source(),
         ]
-        .map(|src| {
-            src.map(|d| {
-                rewrite_expr(
-                    d,
-                    &self.ctx.prefix,
-                    &self.ctx.port_map,
-                    &self.ctx.local_names,
-                    &self.ctx.interface_map,
-                )
-            })
-        });
+        .map(|src| src.map(|d| rewrite_delay(d)));
         let (delay, delay_fall, delay_off, delay_exprs) =
             cont_assign_delays(operands.each_ref().map(Option::as_ref), params);
         let origin = self
             .origin_span
             .map(|sp| (sp, std::sync::Arc::clone(&self.ctx.origin_scope)));
-        ContinuousAssignment::with_extras(
+        let mut driver = ContinuousAssignment::with_extras(
             lhs,
             rhs,
             delay,
@@ -2357,7 +2366,15 @@ impl PendingContAssign {
             delay_exprs,
             None,
             origin,
-        )
+        );
+        if let Some(delay) = self
+            .extras
+            .as_deref()
+            .and_then(|ex| ex.array_stage_delay.as_deref())
+        {
+            driver.set_array_stage_delay(std::sync::Arc::new(rewrite_delay(delay)));
+        }
+        driver
     }
 }
 

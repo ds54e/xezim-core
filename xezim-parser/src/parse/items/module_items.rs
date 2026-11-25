@@ -417,6 +417,7 @@ impl<'a> Parser<'a> {
                     delay: delay.map(Box::new),
                     delay_fall: delay_fall.map(Box::new),
                     delay_off: delay_off.map(Box::new),
+                    array_stage_delay: None,
                     assignments: asgns,
                     span: self.span_from(start),
                 }))

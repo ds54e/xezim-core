@@ -1016,6 +1016,7 @@ pub(super) fn elaborate_items(
             ModuleItem::ContinuousAssign(ca) => {
                 let (delay, delay_fall, delay_off, delay_exprs) = cont_assign_delays(
                     [ca.delay.as_deref(), ca.delay_fall.as_deref(), ca.delay_off.as_deref()], &elab.parameters);
+                let array_stage_delay = ca.array_stage_delay.as_deref().cloned().map(std::sync::Arc::new);
                 for (lhs, rhs) in &ca.assignments {
                     // §10.3.1 / §21.2.1.5: record the drive strength pair on
                     // the target net so `%v` can report it (e.g. "Pu0").
@@ -1052,7 +1053,7 @@ pub(super) fn elaborate_items(
                         &|n| elab.struct_members.contains_key(n),
                         &|n| elab.packages.contains(n),
                     );
-                    let driver = ContinuousAssignment::with_extras(
+                    let mut driver = ContinuousAssignment::with_extras(
                         lhs.clone(),
                         rhs_final,
                         delay,
@@ -1064,6 +1065,9 @@ pub(super) fn elaborate_items(
                         None,
                         Some((ca.span, top_origin_scope())),
                     );
+                    if let Some(operand) = &array_stage_delay {
+                        driver.set_array_stage_delay(std::sync::Arc::clone(operand));
+                    }
                     if !expand_whole_array_assign(&driver, elab) {
                         elab.continuous_assigns.push(driver);
                     }

@@ -361,6 +361,27 @@ fn gen_expr(e: &Expression) -> Expression {
     with_genvar(|m| rewrite_expr(e, "", m, &Default::default(), &HashMap::default()))
 }
 
+fn gen_array_stage_delay(e: &Expression) -> Expression {
+    with_genvar(|m| {
+        // §27.4: the implicit localparam is a signed 32-bit integer. Match
+        // the literal's decoded bits after artifact readback.
+        if let Some((name, literal)) = m.iter().next()
+            && let ExprKind::Number(NumberLiteral::Integer { cached_val, .. }) = &literal.kind
+            && let Some((bits, 0, 32)) = cached_val.get()
+            && bits > u32::MAX as u64
+        {
+            let mut normalized = m.clone();
+            let mut literal = literal.clone();
+            if let ExprKind::Number(NumberLiteral::Integer { cached_val, .. }) = &mut literal.kind {
+                *cached_val = Default::default();
+            }
+            normalized.insert(name.clone(), literal);
+            return rewrite_expr(e, "", &normalized, &Default::default(), &HashMap::default());
+        }
+        rewrite_expr(e, "", m, &Default::default(), &HashMap::default())
+    })
+}
+
 fn gen_stmt(s: &Statement) -> Statement {
     with_genvar(|m| rewrite_stmt(s, "", m, &Default::default(), &HashMap::default()))
 }
@@ -601,6 +622,16 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
         }
         ModuleItem::ContinuousAssign(ca) => {
             let mut new_ca = ca.clone();
+            // §10.3.3 permits only one operand on a user-defined nettype.
+            // Its array-cell stage can use the generate scope and iteration
+            // constants (§23.9, §27.4); keep the original delay operands.
+            if ca.delay_fall.is_none()
+                && ca.delay_off.is_none()
+                && let Some(d) = ca.array_stage_delay.as_deref().or(ca.delay.as_deref())
+                && !matches!(d.kind, ExprKind::Number(_))
+            {
+                new_ca.array_stage_delay = Some(Box::new(gen_array_stage_delay(d)));
+            }
             new_ca.assignments = ca
                 .assignments
                 .iter()

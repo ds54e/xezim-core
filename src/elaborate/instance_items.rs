@@ -6736,9 +6736,13 @@ pub(super) fn inline_instantiation_items(
                             .delay_off
                             .as_deref()
                             .map(|d| std::rc::Rc::new(d.clone()));
+                        let array_stage_delay = ca_item
+                            .array_stage_delay
+                            .as_deref()
+                            .map(|d| std::rc::Rc::new(d.clone()));
                         if let BodySource::ContAssign(pairs) = body_src {
                             for (lhs_rc, rhs_rc) in pairs {
-                                elab.pending_cont_assign.push(PendingContAssign::new(
+                                let mut pending = PendingContAssign::new(
                                     std::rc::Rc::clone(lhs_rc),
                                     false,
                                     std::rc::Rc::clone(rhs_rc),
@@ -6748,7 +6752,11 @@ pub(super) fn inline_instantiation_items(
                                     delay_fall_rc.clone(),
                                     delay_off_rc.clone(),
                                     Some(ca_item.span),
-                                ));
+                                );
+                                if let Some(extras) = pending.extras.as_deref_mut() {
+                                    extras.array_stage_delay = array_stage_delay.clone();
+                                }
+                                elab.pending_cont_assign.push(pending);
                             }
                         }
                     }

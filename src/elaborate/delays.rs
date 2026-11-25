@@ -827,6 +827,16 @@ pub(super) fn cont_assign_delays(
     (rise.unwrap_or(0), fall, off, None)
 }
 
+impl ContinuousAssignment {
+    pub(super) fn set_array_stage_delay(&mut self, delay: std::sync::Arc<Expression>) {
+        self.make_full_mut().delays_mut().array_stage_delay = Some(delay);
+    }
+
+    pub(super) fn array_stage_delay(&self) -> Option<&std::sync::Arc<Expression>> {
+        self.delays().and_then(|d| d.array_stage_delay.as_ref())
+    }
+}
+
 pub(super) fn net_decl_assign_delay(
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,
